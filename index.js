@@ -103,7 +103,13 @@ async function apiFetch(path, opts = {}) {
         console.warn("[DJ-Eva] Direct fetch failed, trying proxy:", e.message);
     }
 
-    // Fallback: try through SillyTavern proxy
+    // Fallback: try through SillyTavern proxy — but ONLY for GET requests
+    // POST requests (play/pause/volume) do NOT go through proxy since ST proxy blocks them with 403
+    if (opts.method === "POST" || opts.method === "PUT" || opts.method === "DELETE") {
+        toastr.error(`Control action failed via proxy (HTTP 403). Uncheck "Use SillyTavern proxy" in settings to control directly.`);
+        return null;
+    }
+
     try {
         const r = await tryFetch(proxyUrl);
         if (r.ok) {
@@ -111,12 +117,6 @@ async function apiFetch(path, opts = {}) {
             if (!j.ok) {
                 toastr.error(j.error || "DJ API error", "DJ Eva");
                 return null;
-            }
-            // Swap to proxy mode silently
-            if (!extension_settings.djeva?.useProxy) {
-                extension_settings.djeva.useProxy = true;
-                saveSettingsDebounced();
-                toastr.info("Switched to proxy mode automatically", "DJ Eva");
             }
             return j;
         } else {
