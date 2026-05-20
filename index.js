@@ -5,6 +5,10 @@
  * Settings panel lets you configure:
  *   - API URL: the base URL of the DJ API server (Eva-PC)
  *   - Use Proxy: route through SillyTavern's /proxy to avoid mixed-content blocks
+ *   - Default Device: which Plexamp client to control (VHX or discovered clients)
+ *
+ * NOTE: For /clients discovery to work, use a full Plex token (not a claim token)
+ * in the PLEX_TOKEN env var on Eva-PC. Claim tokens only allow playback, not client listing.
  *
  * Author: Joe Armella
  * License: AGPL-3.0
@@ -21,46 +25,105 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 
 const defaultSettings = {
     apiUrl: 'http://100.120.54.7:38250',
-    useProxy: true,
+    useProxy: false,
+    deviceName: 'VHX',
+    deviceUrl: '',
+    deviceId: '',
 };
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-let currentStatus = { state: "idle", playing: false, track: null };
-let suggestCache  = [];
-let isLoading     = false;
+let currentStatus  = { state: "idle", playing: false, track: null };
+let suggestCache   = [];
+let isLoading      = false;
+let discoveredClients = [];
 
 // ── API URL resolver ─────────────────────────────────────────────────────────
 
 function getApiBase() {
+    const base = extension_settings.djeva?.apiUrl || defaultSettings.apiUrl;
     if (extension_settings.djeva?.useProxy && window.location.origin) {
-        // SillyTavern's built-in proxy: https://host/proxy/http://target
-        // This avoids mixed-content blocking when ST is served over HTTPS
-        return window.location.origin + '/proxy' + extension_settings.djeva.apiUrl;
+        // Route through SillyTavern's built-in proxy to avoid HTTPS→HTTP mixed-content blocks
+        return window.location.origin + '/proxy' + base;
     }
-    return extension_settings.djeva?.apiUrl || defaultSettings.apiUrl;
+    return base;
 }
 
 function addSlash(url) {
     return url.endsWith('/') ? url : url + '/';
 }
 
-// ── API helpers ──────────────────────────────────────────────────────────────
+function getProxyBase() {
+    // Always try proxy if direct fails
+    const direct = extension_settings.djeva?.apiUrl || defaultSettings.apiUrl;
+    return window.location.origin + '/proxy' + direct;
+}
+
+// ── Fetch with fallback: try direct, then proxy ─────────────────────────────
 
 async function apiFetch(path, opts = {}) {
-    const base = addSlash(getApiBase());
-    const url = base + 'api/dj' + path;  // path starts with /
-    try {
+    const directBase = addSlash(extension_settings.djeva?.apiUrl || defaultSettings.apiUrl);
+    const proxyBase  = addSlash(getProxyBase());
+
+    const directUrl = directBase + 'api/dj' + path;
+    const proxyUrl  = proxyBase  + 'api/dj' + path;
+
+    async function tryFetch(url) {
         const r = await fetch(url, {
+            signal: AbortSignal.timeout(8000),
             headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
             ...opts,
         });
-        const j = await r.json();
-        if (!j.ok) {
-            toastr.error(j.error || "DJ API error", "DJ Eva");
+        return r;
+    }
+
+    // Try direct first (always, since both machines are on tailnet)
+    try {
+        const r = await tryFetch(directUrl);
+        // Treat 4xx/5xx as errors, but do NOT retry on 400 (bad request = user error, not network)
+        if (r.ok) {
+            const j = await r.json();
+            if (!j.ok) {
+                toastr.error(j.error || "DJ API error", "DJ Eva");
+                return null;
+            }
+            return j;
+        }
+        // Network error or HTTP error on direct — try proxy once
+        if (r.status >= 400) {
+            const j = await r.json().catch(() => ({}));
+            // If we get a JSON error from the API itself, don't retry (it's a real error, not a network block)
+            if (j && (j.ok === false || j.error)) {
+                toastr.error(j.error || `HTTP ${r.status}`, "DJ Eva");
+                return null;
+            }
+        }
+    } catch (e) {
+        // Network error on direct — try proxy as fallback
+        console.warn("[DJ-Eva] Direct fetch failed, trying proxy:", e.message);
+    }
+
+    // Fallback: try through SillyTavern proxy
+    try {
+        const r = await tryFetch(proxyUrl);
+        if (r.ok) {
+            const j = await r.json();
+            if (!j.ok) {
+                toastr.error(j.error || "DJ API error", "DJ Eva");
+                return null;
+            }
+            // Swap to proxy mode silently
+            if (!extension_settings.djeva?.useProxy) {
+                extension_settings.djeva.useProxy = true;
+                saveSettingsDebounced();
+                toastr.info("Switched to proxy mode automatically", "DJ Eva");
+            }
+            return j;
+        } else {
+            const j = await r.json().catch(() => ({}));
+            toastr.error(j?.error || `Proxy error: HTTP ${r.status}`, "DJ Eva");
             return null;
         }
-        return j;
     } catch (e) {
         toastr.error(`DJ API unreachable: ${e.message}`, "DJ Eva");
         return null;
@@ -70,7 +133,11 @@ async function apiFetch(path, opts = {}) {
 // ── Refresh now-playing ──────────────────────────────────────────────────────
 
 async function refreshStatus() {
-    const res = await apiFetch("/status");
+    const url    = extension_settings.djeva?.deviceUrl || null;
+    const clientId = extension_settings.djeva?.deviceId || null;
+    const qs = url    ? `?client=${encodeURIComponent(url)}` : '';
+    const cidQs = clientId ? `${qs ? '&' : '?'}clientId=${encodeURIComponent(clientId)}` : '';
+    const res = await apiFetch("/status" + qs + cidQs);
     if (!res) return;
     currentStatus = res.data || currentStatus;
     updateNowPlayingUI(currentStatus);
@@ -88,9 +155,9 @@ function updateNowPlayingUI(status) {
         return;
     }
     const t = status.track;
-    const artist = t.artist || "";
-    const title  = t.title  || "Unknown";
-    const state  = status.state || "unknown";
+    const artist  = t.artist || "";
+    const title   = t.title  || "Unknown";
+    const state   = status.state || "unknown";
     const elapsed = status.time ? fmtDuration(status.time) : "?";
     const total   = t.duration ? fmtDuration(t.duration * 1000) : "?";
     el.innerHTML = `
@@ -123,16 +190,16 @@ async function doSearch(query, mode = "keyword") {
     isLoading = false;
     setLoading(false);
     if (!res || !res.data?.tracks?.length) {
-        document.getElementById("djeva_results").innerHTML =
-            `<div class="djeva_empty">No tracks found for <em>${escHtml(query)}</em></div>`;
+        const el = document.getElementById("djeva_results");
+        if (el) el.innerHTML = `<div class="djeva_empty">No tracks found for <em>${escHtml(query)}</em></div>`;
         suggestCache = [];
         return;
     }
     suggestCache = res.data.tracks;
-    renderResults(suggestCache, mode);
+    renderResults(suggestCache);
 }
 
-function renderResults(tracks, mode) {
+function renderResults(tracks) {
     const list = document.getElementById("djeva_results");
     if (!list) return;
     list.innerHTML = tracks.map((t, i) => `
@@ -173,9 +240,14 @@ function renderLibraryTracks(tracks) {
 // ── Playback actions ─────────────────────────────────────────────────────────
 
 async function playTrack(key) {
+    const body = { ratingKey: String(key).split("/").pop() };
+    const url    = extension_settings.djeva?.deviceUrl   || null;
+    const clientId = extension_settings.djeva?.deviceId || null;
+    if (url)    body.client    = url;
+    if (clientId) body.clientId = clientId;
     const res = await apiFetch("/play", {
         method: "POST",
-        body: JSON.stringify({ ratingKey: String(key).split("/").pop() }),
+        body: JSON.stringify(body),
     });
     if (res) {
         toastr.success(`▶ ${res.data?.track?.title || "Track"}`, "DJ Eva");
@@ -184,9 +256,14 @@ async function playTrack(key) {
 }
 
 async function doControl(action) {
+    const body     = { action };
+    const url      = extension_settings.djeva?.deviceUrl   || null;
+    const clientId = extension_settings.djeva?.deviceId || null;
+    if (url)     body.client    = url;
+    if (clientId) body.clientId = clientId;
     const res = await apiFetch("/control", {
         method: "POST",
-        body: JSON.stringify({ action }),
+        body: JSON.stringify(body),
     });
     if (res) {
         toastr.info(action, "DJ Eva");
@@ -195,9 +272,14 @@ async function doControl(action) {
 }
 
 async function doVolume(level) {
+    const body     = { level };
+    const url      = extension_settings.djeva?.deviceUrl   || null;
+    const clientId = extension_settings.djeva?.deviceId || null;
+    if (url)     body.client    = url;
+    if (clientId) body.clientId = clientId;
     await apiFetch("/volume", {
         method: "POST",
-        body: JSON.stringify({ level }),
+        body: JSON.stringify(body),
     });
 }
 
@@ -210,6 +292,20 @@ async function loadLibrary() {
     if (res?.data?.tracks) {
         renderLibraryTracks(res.data.tracks);
     }
+}
+
+// ── Client discovery ─────────────────────────────────────────────────────────
+
+async function discoverClients() {
+    const res = await apiFetch("/clients");
+    if (!res?.data?.clients?.length) {
+        discoveredClients = [];
+        return [];
+    }
+    // Prepend VHX default
+    const vhxDefault = { name: 'VHX (default)', baseUrl: '', clientId: '', product: 'Plexamp', state: 'online' };
+    discoveredClients = [vhxDefault, ...res.data.clients];
+    return discoveredClients;
 }
 
 // ── UI helpers ───────────────────────────────────────────────────────────────
@@ -233,82 +329,163 @@ function renderSettingsPanel() {
     <div class="djeva_settings">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>🎧 DJ Eva</b>
+                <b>🎧 DJ Eva — Settings</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
                 <div>
                     <label for="djeva_api_url">DJ API URL</label>
-                    <div><small>The base URL of Eva's DJ API server (e.g. http://100.120.54.7:38250)</small></div>
+                    <div><small>Eva-PC's DJ API server base URL</small></div>
                     <input id="djeva_api_url" class="text_pole" type="text" placeholder="${defaultSettings.apiUrl}" />
                 </div>
                 <div>
-                    <label class="checkbox_label for="djeva_use_proxy">
+                    <label for="djeva_device">Default Device</label>
+                    <div><small>Which Plexamp client to control. Discover clients after setting a full Plex token on Eva-PC.</small></div>
+                    <select id="djeva_device" class="text_pole">
+                        <option value="VHX">VHX (default)</option>
+                    </select>
+                    <button id="djeva_discover_btn" class="menu_button" style="margin-top:4px">
+                        <i class="fa-solid fa-magnifying-glass"></i> Discover Clients
+                    </button>
+                </div>
+                <div>
+                    <label class="checkbox_label">
                         <input id="djeva_use_proxy" type="checkbox" />
                         <span>Use SillyTavern proxy</span>
-                        <a rel="noopener" href="https://docs.sillytavern.app/usage/proxy/" class="notes-link" target="_blank">
-                            <span class="note-link-span">?</span>
-                        </a>
                     </label>
-                    <div><small>Enable this if SillyTavern is served over HTTPS and the API is HTTP. Routes requests through SillyTavern's built-in proxy to avoid mixed-content blocking.</small></div>
+                    <div><small>Enable this when ST is served over HTTPS and the API is on HTTP. Routes through ST's built-in proxy to avoid mixed-content blocking. Auto-enabled if direct connection fails.</small></div>
                 </div>
                 <div class="djeva-status-bar">
-                    <span id="djeva_status" class="djeva_muted">Checking connection…</span>
+                    <span id="djeva_status" class="djeva_muted">—</span>
                 </div>
             </div>
         </div>
     </div>`;
 
-    const extensionContainer = document.getElementById('djeva_settings_container') ?? document.getElementById('extensions_settings');
-    $(extensionContainer).append(html);
+    const container = document.getElementById('djeva_settings_container') ?? document.getElementById('extensions_settings');
+    $(container).append(html);
 
-    // Populate from settings
-    if (extension_settings.djeva === undefined) {
-        extension_settings.djeva = {};
-    }
+    // Init settings
+    if (extension_settings.djeva === undefined) extension_settings.djeva = {};
     for (const key in defaultSettings) {
         if (extension_settings.djeva[key] === undefined) {
             extension_settings.djeva[key] = defaultSettings[key];
         }
     }
 
-    $('#djeva_api_url').val(extension_settings.djeva.apiUrl).on('input', function () {
+    // Populate fields
+    $('#djeva_api_url').val(extension_settings.djeva.apiUrl || defaultSettings.apiUrl);
+    $('#djeva_use_proxy').prop('checked', !!extension_settings.djeva.useProxy);
+
+    // Populate device dropdown
+    rebuildDeviceDropdown(extension_settings.djeva.deviceName || 'VHX');
+    if (extension_settings.djeva.deviceName) {
+        $(`#djeva_device option[value="${escHtml(extension_settings.djeva.deviceName)}"]`).prop('selected', true).attr('selected', 'selected');
+    }
+
+    // Bind events
+    $('#djeva_api_url').on('input', function () {
         extension_settings.djeva.apiUrl = String($(this).val());
         saveSettingsDebounced();
         checkConnection();
     });
 
-    $('#djeva_use_proxy').prop('checked', extension_settings.djeva.useProxy).on('change', function () {
+    $('#djeva_use_proxy').on('change', function () {
         extension_settings.djeva.useProxy = !!$(this).prop('checked');
         saveSettingsDebounced();
+        checkConnection();
     });
 
-    // Initial connection check
+    $('#djeva_device').on('change', function () {
+        const selected = $(this).val();
+        const client = discoveredClients.find(c => c.name === selected);
+        if (client) {
+            extension_settings.djeva.deviceName = client.name;
+            extension_settings.djeva.deviceUrl  = client.baseUrl;
+            extension_settings.djeva.deviceId   = client.clientId;
+            saveSettingsDebounced();
+            refreshStatus();
+        }
+    });
+
+    $('#djeva_discover_btn').on('click', async function () {
+        const btn = $(this);
+        btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Discovering…');
+        try {
+            const clients = await discoverClients();
+            rebuildDeviceDropdown(extension_settings.djeva.deviceName || 'VHX');
+            if (clients.length > 0) {
+                toastr.success(`Found ${clients.length} client(s)`, "DJ Eva");
+            } else {
+                toastr.warning('No clients found. Enable full Plex token on Eva-PC.', "DJ Eva");
+            }
+        } finally {
+            btn.prop('disabled', false).html('<i class="fa-solid fa-magnifying-glass"></i> Discover Clients');
+        }
+    });
+
     setTimeout(checkConnection, 500);
+}
+
+function rebuildDeviceDropdown(selectedName) {
+    const sel = $('#djeva_device');
+    sel.empty();
+    discoveredClients.forEach(c => {
+        const label = c.name + (c.product ? ` (${c.product})` : '');
+        sel.append(`<option value="${escHtml(c.name)}">${escHtml(label)}</option>`);
+    });
+    if (selectedName) {
+        $(`#djeva_device option[value="${escHtml(selectedName)}"]`).prop('selected', true);
+    }
 }
 
 async function checkConnection() {
     const el = document.getElementById('djeva_status');
     if (!el) return;
-    const base = addSlash(getApiBase());
-    const url = base + 'api/dj/ping';
-    try {
-        const r = await fetch(url, { signal: AbortSignal.timeout(4000) });
-        if (r.ok) {
-            const j = await r.json();
-            el.textContent = j?.ok ? `✓ Connected — ${j.ts}` : '✗ Unexpected response';
-            el.style.color = 'var(--success)';
-        } else {
-            el.textContent = `✗ HTTP ${r.status}`;
-            el.style.color = 'var(--error)';
+    el.textContent = "Checking…";
+    el.style.color = "";
+
+    const directBase = addSlash(extension_settings.djeva?.apiUrl || defaultSettings.apiUrl);
+    const directUrl  = directBase + 'api/dj/ping';
+    const proxyBase  = addSlash(getProxyBase());
+    const proxyUrl   = proxyBase  + 'api/dj/ping';
+
+    async function probe(url, label) {
+        try {
+            const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+            if (r.ok) {
+                const j = await r.json();
+                if (j?.ok) return `✓ Direct: ${label}`;
+            }
+            if (r.status === 401 || r.status === 403) return `✗ ${label} (auth error — is PLEX_TOKEN valid?)`;
+            return `✗ ${label} (HTTP ${r.status})`;
+        } catch (e) {
+            return null;  // unreachable
         }
-    } catch (e) {
-        el.textContent = `✗ ${e.message || 'Unreachable'}`;
-        el.style.color = 'var(--error)';
     }
+
+    const directResult = await probe(directUrl, 'direct');
+    if (directResult) {
+        el.textContent = directResult;
+        el.style.color = directResult.startsWith("✓") ? 'var(--success)' : 'var(--error)';
+        return;
+    }
+
+    // Try proxy
+    if (extension_settings.djeva?.useProxy !== false) {
+        const proxyResult = await probe(proxyUrl, 'proxy');
+        if (proxyResult) {
+            el.textContent = proxyResult + ' — enable proxy in settings';
+            el.style.color = 'var(--warning)';
+            return;
+        }
+    }
+
+    el.textContent = "✗ Unreachable (both direct and proxy failed)";
+    el.style.color = 'var(--error)';
 }
 
-// ── Main panel (now-playing, controls, search) ───────────────────────────────
+// ── Main panel ───────────────────────────────────────────────────────────────
 
 function renderMainPanel() {
     const html = `
@@ -387,48 +564,37 @@ function renderMainPanel() {
         </div>
     </div>`;
 
-    const extensionContainer = document.getElementById('djeva_main_container') ?? document.getElementById('extensions_settings2');
-    $(extensionContainer).append(html);
+    const container = document.getElementById('djeva_main_container') ?? document.getElementById('extensions_settings2');
+    $(container).append(html);
 }
 
 // ── Event bindings ───────────────────────────────────────────────────────────
 
 function bindEvents() {
-    // Playback controls
     $(document).on("click", "#djeva_play",  () => doControl("play"));
     $(document).on("click", "#djeva_pause", () => doControl("pause"));
     $(document).on("click", "#djeva_stop",  () => doControl("stop"));
     $(document).on("click", "#djeva_next",  () => doControl("skipnext"));
     $(document).on("click", "#djeva_prev",  () => doControl("skipprev"));
 
-    // Volume slider
     $(document).on("input", "#djeva_volume", debounce(async e => {
         const lvl = parseInt($(e.target).val(), 10);
         $("#djeva_vol_pct").text(`${lvl}%`);
         await doVolume(lvl);
     }, 400));
 
-    // Search bar: button
     $(document).on("click", "#djeva_search_btn", async () => {
         const q    = $("#djeva_query").val()?.trim();
         const mode = $("#djeva_mode").val();
         if (!q) return;
-        if (mode === "keyword") {
-            await doSearch(q, "keyword");
-        } else if (mode === "semantic") {
-            await doSearch(q, "semantic");
-        } else {
-            await doSearch(q, "auto");
-        }
+        await doSearch(q, mode);
     });
 
-    // Search bar: Enter key
-    $(document).on("keydown", "#djeva_query", async e => {
+    $(document).on("keydown", "#djeva_query", e => {
         if (e.key !== "Enter") return;
         $("#djeva_search_btn").trigger("click");
     });
 
-    // Mood chips
     $(document).on("click", ".djeva-mood-btn", async e => {
         const mood = $(e.currentTarget).data("mood");
         if (!mood) return;
@@ -452,16 +618,14 @@ function bindEvents() {
             return;
         }
         toastr.success(`${mood} → ${res.data.tracks[0].title}`, "DJ Eva");
-        renderResults(res.data.tracks, "semantic");
+        renderResults(res.data.tracks);
     });
 
-    // Play result button
     $(document).on("click", ".djeva-play-btn", async e => {
         const key = $(e.currentTarget).data("key");
         if (key) await playTrack(key);
     });
 
-    // Random library
     $(document).on("click", "#djeva_library_btn", loadLibrary);
 }
 
@@ -542,82 +706,29 @@ function registerSlashCommands() {
                 }
 
                 return `<b>DJ Eva — /dj</b>
-<div>/dj play &lt;query&gt; — search + play</div>
-<div>/dj &lt;natural language&gt; — semantic search + play</div>
+<div>/dj &lt;query&gt; — search + play</div>
+<div>/dj &lt;natural language&gt; — AI semantic search + play</div>
 <div>/dj key=&lt;key&gt; — play by Plex key</div>
 <div>/dj pause|stop|skipnext|resume</div>
 <div>/dj volume level=80</div>
 <div>/dj mood happy|sad|energetic|chill|intense|romantic|nostalgic</div>
-<div>/dj mode=semantic|keyword</div>
-<div>/dj library|shuffle — random tracks</div>`;
+<div>/dj library|shuffle</div>`;
             },
             returns: "DJ action result or track list",
             namedArgumentList: [
-                SlashCommandNamedArgument.fromProps({
-                    name: "action",
-                    description: "Action: play, pause, stop, skipnext, skipprev, resume, library, shuffle, random",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                    enumList: ["play", "pause", "stop", "skipnext", "skipprev", "resume", "next", "prev", "library", "shuffle", "random"],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "key",
-                    description: "Plex ratingKey or /library/metadata/… path",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "track",
-                    description: "Alternate key field",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "volume",
-                    description: "Volume level 0-100",
-                    typeList: [ARGUMENT_TYPE.NUMBER],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "level",
-                    description: "Volume level (alias)",
-                    typeList: [ARGUMENT_TYPE.NUMBER],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "mood",
-                    description: "Mood filter: happy, sad, energetic, chill, intense, romantic, nostalgic",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                    enumList: ["happy", "sad", "energetic", "chill", "intense", "romantic", "nostalgic"],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "mode",
-                    description: "Search mode: semantic (AI) or keyword (Plex default)",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                    enumList: ["semantic", "keyword", "auto"],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "limit",
-                    description: "Max results (default 10)",
-                    typeList: [ARGUMENT_TYPE.NUMBER],
-                    defaultValue: "10",
-                }),
+                SlashCommandNamedArgument.fromProps({ name: "action",  description: "pause|stop|skipnext|resume|play|key=|volume|mood", typeList: [ARGUMENT_TYPE.STRING] }),
+                SlashCommandNamedArgument.fromProps({ name: "key",     description: "Plex ratingKey", typeList: [ARGUMENT_TYPE.STRING] }),
+                SlashCommandNamedArgument.fromProps({ name: "track",   description: "Plex key (alias)", typeList: [ARGUMENT_TYPE.STRING] }),
+                SlashCommandNamedArgument.fromProps({ name: "volume",  description: "Volume 0-100", typeList: [ARGUMENT_TYPE.NUMBER] }),
+                SlashCommandNamedArgument.fromProps({ name: "level",   description: "Volume (alias)", typeList: [ARGUMENT_TYPE.NUMBER] }),
+                SlashCommandNamedArgument.fromProps({ name: "mood",    description: "happy|sad|energetic|chill|intense|romantic|nostalgic", typeList: [ARGUMENT_TYPE.STRING] }),
+                SlashCommandNamedArgument.fromProps({ name: "mode",    description: "semantic|keyword|auto", typeList: [ARGUMENT_TYPE.STRING] }),
+                SlashCommandNamedArgument.fromProps({ name: "limit",   description: "Max results", typeList: [ARGUMENT_TYPE.NUMBER], defaultValue: "10" }),
             ],
             unnamedArgumentList: [
-                SlashCommandArgument.fromProps({
-                    description: "Search query or natural-language request",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                    isRequired: false,
-                }),
+                SlashCommandArgument.fromProps({ description: "search query or natural language", typeList: [ARGUMENT_TYPE.STRING], isRequired: false }),
             ],
-            helpString: `
-<div><b>DJ Eva — Plexamp Control</b></div>
-<div>Use natural language or keywords to search your Plex library.</div>
-<br/>
-<div><b>Examples:</b></div>
-<ul>
-  <li><code>/dj play pumping music</code></li>
-  <li><code>/dj driving at night songs</code></li>
-  <li><code>/dj i need something chill to study to</code></li>
-  <li><code>/dj mood energetic</code></li>
-  <li><code>/dj library</code></li>
-  <li><code>/dj volume level=60</code></li>
-</ul>`,
+            helpString: `<b>DJ Eva — Plexamp</b><br/><code>/dj pumping music</code><br/><code>/dj mood energetic</code><br/><code>/dj library</code><br/><code>/dj i want something chill to study to</code>`,
         })
     );
 
@@ -632,23 +743,18 @@ function registerSlashCommands() {
                 return `Now playing: ${t.title} — ${t.artist} (${t.album})`;
             },
             returns: "Current track",
-            helpString: "<div><b>/nowplaying</b> — show what's playing on Plexamp</div>",
+            helpString: "<b>/nowplaying</b> — show what's playing",
         })
     );
 }
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 
-function clamp(v, lo, hi) {
-    return Math.max(lo, Math.min(hi, v));
-}
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 function debounce(fn, ms) {
     let timer;
-    return (...args) => {
-        clearTimeout(timer);
-        timer = setTimeout(() => fn(...args), ms);
-    };
+    return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
