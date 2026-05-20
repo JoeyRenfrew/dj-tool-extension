@@ -2,7 +2,7 @@
  * Extension-DJEva — SillyTavern UI Extension
  * DJ Eva: Plexamp control with semantic (FAISS) search via /dj slash commands.
  *
- * The extension calls the DJ API on Eva-PC (http://eva-pc.ts.net:38250)
+ * The extension calls the DJ API on Eva-PC (http://100.120.54.7:38250)
  * instead of running Plexapi directly. This keeps secrets and the heavy
  * lifting on the server and keeps the SillyTavern install clean.
  *
@@ -12,7 +12,7 @@
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const API = "http://eva-pc.ts.net:38250/api/dj";
+const API = "http://100.120.54.7:38250/api/dj";
 const EXT  = "dj-eva";
 const FOLDER = `scripts/extensions/third-party/${EXT}`;
 
