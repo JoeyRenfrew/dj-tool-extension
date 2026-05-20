@@ -1,0 +1,11 @@
+{
+    "display_name": "DJ Eva — Plexamp",
+    "loading_order": 10,
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Joe Armella",
+    "version": "0.1.0",
+    "homePage": "https://github.com/eva-pc/Extension-DJEva",
+    "auto_update": true,
+    "minimum_client_version": "1.12.0"
+}
