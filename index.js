@@ -737,6 +737,36 @@ function registerSlashCommands() {
                     }
                 }
 
+                // Bare suggest command: "/dj suggest put on heist music"
+                if (query && !mood && !action && !key) {
+                    const raw = query.toLowerCase().trim();
+                    const suggestMatch = raw.match(/^(suggest\s+.*)$/i);
+                    if (suggestMatch) {
+                        const desc = suggestMatch[1].replace(/^suggest\s+/i, "").trim();
+                        if (!desc) return "Usage: /dj suggest &lt;scene or mood description&gt; (e.g. \"heist movie music\")";
+                        const res = await apiFetch("/suggest", "POST", { query: desc, limit: 5 });
+                        if (!res) return "DJ API unreachable for suggest.";
+                        const suggestions = res?.data?.suggestions || [];
+                        const total = res?.data?.total_in_library || 0;
+                        const libMsg = res?.data?.library_message || "";
+                        if (total === 0) {
+                            const addTips = suggestions
+                                .filter(s => s.action === "SUGGEST_ADD")
+                                .slice(0, 3)
+                                .map(s => `"${s.title}" by ${s.artist}`)
+                                .join(", ");
+                            if (addTips) return `Nothing in your library matches "${desc}". Add to Plex: ${addTips}.`;
+                            return `No library or Plex matches for "${desc}". Try a different description.`;
+                        }
+                        const pick = suggestions.find(s => s.available && s.ratingKey);
+                        if (pick) {
+                            await playTrack(pick.ratingKey);
+                            return `${libMsg} Playing: "${pick.title}" by ${pick.artist}.`;
+                        }
+                        return libMsg;
+                    }
+                }
+
                 if (query) {
                     const semanticTriggers = /^(play|find|music|songs|tracks|something|put on|i want|i feel|i need|lists|music for)/i;
                     const useSemantic = mode === "semantic" || (mode === "auto" && semanticTriggers.test(query));
@@ -758,7 +788,8 @@ function registerSlashCommands() {
 <div>/dj pause|stop|skipnext|resume</div>
 <div>/dj volume level=80</div>
 <div>/dj mood happy|sad|energetic|chill|intense|romantic|nostalgic</div>
-<div>/dj library|shuffle</div>`;
+<div>/dj library|shuffle</div>
+<div>/dj suggest &lt;scene/vibe&gt; — cross-check library, play best match or suggest additions</div>`;
             },
             returns: "DJ action result or track list",
             namedArgumentList: [
@@ -819,11 +850,14 @@ function registerFunctionTools() {
                 action: {
                     type: "string",
                     enum: ["nowplaying", "status", "play", "pause", "stop", "resume",
-                           "skipnext", "skipprev", "shuffle", "library", "mood", "search"],
+                           "skipnext", "skipprev", "shuffle", "library", "mood", "search",
+                           "suggest"],
                     description:
                         "Action to perform. 'nowplaying'/'status' = get current track. " +
                         "'mood' = AI semantic search + play by mood (mood param required). " +
                         "'search' = search by keyword or natural language (query param). " +
+                        "'suggest' = natural-language scene/vibe query → cross-check Joe's library, " +
+                        "play best match, or suggest tracks to add. Best for roleplay music cues. " +
                         "'play'/'pause'/'stop'/'resume'/'skipnext'/'skipprev' = playback control. " +
                         "'shuffle'/'library' = random library track.",
                 },
@@ -835,7 +869,9 @@ function registerFunctionTools() {
                 },
                 query: {
                     type: "string",
-                    description: "Search query or natural language description (e.g. 'pumping gym music', 'dinner party vibes'). Used with action='search' or action='mood'.",
+                    description: "Natural-language scene, vibe, genre, or mood description " +
+                        "(e.g. 'heist movie soundtrack', 'chill lofi for studying', " +
+                        "'epic boss fight music'). Used with action='search', 'mood', or 'suggest'.",
                 },
                 volume: {
                     type: "number",
@@ -933,6 +969,41 @@ function registerFunctionTools() {
                 await playTrack(pick.ratingKey);
                 const label = useSemantic ? "AI match" : "Search match";
                 return `${label} → "${pick.title}" by ${pick.artist}`;
+            }
+
+            if (action === "suggest" && query) {
+                console.info(`[DJ-Eva] Suggest: '${query}'`);
+                const res = await apiFetch("/suggest", "POST", { query, limit });
+                if (!res) {
+                    console.error(`[DJ-Eva] Suggest '${query}' — API call failed`);
+                    return `Could not reach DJ API. Check that Eva-PC is online and the service is running.`;
+                }
+                const suggestions = res?.data?.suggestions || [];
+                const totalInLibrary = res?.data?.total_in_library || 0;
+                const libraryMessage = res?.data?.library_message || "";
+
+                if (totalInLibrary === 0) {
+                    // Nothing in library — return what Plex suggests adding
+                    const addTips = suggestions
+                        .filter(s => s.action === "SUGGEST_ADD")
+                        .slice(0, 3)
+                        .map(s => `\"${s.title}\" by ${s.artist}`)
+                        .join(", ");
+                    if (addTips) {
+                        return `Your library doesn't have anything matching \"${query}\". ` +
+                               `Plex suggests adding: ${addTips}. Add these to Plex to play them.`;
+                    }
+                    return `No tracks found matching \"${query}\" in your library or on Plex. Try a different description.`;
+                }
+
+                // Play the best library match
+                const pick = suggestions.find(s => s.available && s.ratingKey);
+                if (pick) {
+                    await playTrack(pick.ratingKey);
+                    return `♪ ${libraryMessage} Playing: \"${pick.title}\" by ${pick.artist}.`;
+                }
+
+                return libraryMessage || `Found ${totalInLibrary} track(s) for \"${query}\".`;
             }
 
             if (action === "shuffle" || action === "library") {
