@@ -885,9 +885,25 @@ function registerFunctionTools() {
 
             if (action === "mood") {
                 const desc = moodMap[mood] || mood || query || "moody atmospheric";
+                console.info(`[DJ-Eva] Mood search: '${desc}'`);
                 const semRes = await apiFetch(`/semantic?q=${encodeURIComponent(desc)}&limit=${limit}`);
-                if (!semRes?.data?.tracks?.length) return `No tracks found for mood: ${mood}.`;
-                const pick = semRes.data.tracks[0];
+                if (!semRes) {
+                    console.error(`[DJ-Eva] Mood '${desc}' — API call failed`);
+                    return `Could not reach DJ API. Check that Eva-PC is online and the service is running (systemctl status dj-api).`;
+                }
+                const tracks = semRes?.data?.tracks;
+                if (!tracks || tracks.length === 0) {
+                    // Fallback: try keyword search if semantic found nothing
+                    const kRes = await apiFetch(`/search?q=${encodeURIComponent(desc)}&limit=${limit}`);
+                    const kTracks = kRes?.data?.tracks;
+                    if (!kTracks || kTracks.length === 0) {
+                        return `No tracks found for mood: ${mood} (${desc}).`;
+                    }
+                    const pick = kTracks[0];
+                    await playTrack(pick.ratingKey);
+                    return `♪ Playing [${mood}] (keyword): "${pick.title}" by ${pick.artist}`;
+                }
+                const pick = tracks[0];
                 await playTrack(pick.ratingKey);
                 return `♪ Playing [${mood}]: "${pick.title}" by ${pick.artist} — ${pick.album || ""}`;
             }
@@ -899,8 +915,21 @@ function registerFunctionTools() {
                     ? `/semantic?q=${encodeURIComponent(query)}&limit=${limit}`
                     : `/search?q=${encodeURIComponent(query)}&limit=${limit}`;
                 const res = await apiFetch(path);
-                if (!res?.data?.tracks?.length) return `No tracks found for: ${query}.`;
-                const pick = res.data.tracks[0];
+                if (!res) return `Could not reach DJ API. Check that Eva-PC is online.`;
+                const tracks = res?.data?.tracks;
+                if (!tracks || tracks.length === 0) {
+                    // Fallback: try keyword if semantic empty, or vice versa
+                    const fallbackPath = useSemantic
+                        ? `/search?q=${encodeURIComponent(query)}&limit=${limit}`
+                        : `/semantic?q=${encodeURIComponent(query)}&limit=${limit}`;
+                    const fRes = await apiFetch(fallbackPath);
+                    const fTracks = fRes?.data?.tracks;
+                    if (!fTracks || fTracks.length === 0) return `No tracks found for: ${query}.`;
+                    const pick = fTracks[0];
+                    await playTrack(pick.ratingKey);
+                    return `Search match → "${pick.title}" by ${pick.artist}`;
+                }
+                const pick = tracks[0];
                 await playTrack(pick.ratingKey);
                 const label = useSemantic ? "AI match" : "Search match";
                 return `${label} → "${pick.title}" by ${pick.artist}`;
