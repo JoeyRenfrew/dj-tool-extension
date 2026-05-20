@@ -103,13 +103,20 @@ async function apiFetch(path, opts = {}) {
         console.warn("[DJ-Eva] Direct fetch failed, trying proxy:", e.message);
     }
 
-    // Fallback: try through SillyTavern proxy — but ONLY for GET requests
-    // POST requests (play/pause/volume) do NOT go through proxy since ST proxy blocks them with 403
-    if (opts.method === "POST" || opts.method === "PUT" || opts.method === "DELETE") {
-        toastr.error(`Control action failed via proxy (HTTP 403). Uncheck "Use SillyTavern proxy" in settings to control directly.`);
+    // ── NEVER use SillyTavern proxy for state-changing requests ─────────────────
+    // Joe's Spark PC and Eva-PC are on the same Tailscale tailnet — direct is always
+    // available, no mixed-content issues, and the ST proxy returns 403 on all POSTs.
+    const isMutation = opts.method === "POST" || opts.method === "PUT" || opts.method === "DELETE";
+    if (isMutation && !extension_settings.djeva?.useProxy) {
+        // Proxy explicitly disabled AND this is a mutation — fail immediately, do NOT fall back to proxy
+        const action = opts.body ? JSON.parse(opts.body).action || opts.body : "action";
+        toastr.error(`Direct POST to DJ API failed (or unreachable). Check that Eva-PC is reachable at ${directUrl}`);
+        console.error("[DJ-Eva] Direct POST failed, not retrying via proxy (proxy is disabled):", action);
         return null;
     }
 
+    // GET requests: try direct, fall back to proxy on network failure
+    // ── Proxy fallback for GET only ────────────────────────────────────────────────
     try {
         const r = await tryFetch(proxyUrl);
         if (r.ok) {
@@ -765,6 +772,145 @@ function registerSlashCommands() {
     );
 }
 
+// ── Function calling tool (LLM-native, no keyword needed) ───────────────────────
+
+function registerFunctionTools() {
+    const { registerFunctionTool, isToolCallingSupported } = SillyTavern.getContext();
+    if (!isToolCallingSupported()) {
+        console.info("[DJ-Eva] Function calling not supported on this backend");
+        return;
+    }
+
+    registerFunctionTool({
+        name: "DJ",
+        displayName: "DJ Eva",
+        description:
+            "Use this tool whenever you need to check what music is currently playing, " +
+            "control playback (play/pause/stop/skip), change the volume, search for or play music, " +
+            "or respond to any music-related question in a roleplay scene. " +
+            "Called automatically — do NOT wait to be asked twice. " +
+            "For mood/scene music, prefer /semantic search with natural language (e.g. 'heist music', 'romantic dinner').",
+        parameters: {
+            $schema: "http://json-schema.org/draft-04/schema#",
+            type: "object",
+            properties: {
+                action: {
+                    type: "string",
+                    enum: ["nowplaying", "status", "play", "pause", "stop", "resume",
+                           "skipnext", "skipprev", "shuffle", "library", "mood", "search"],
+                    description:
+                        "Action to perform. 'nowplaying'/'status' = get current track. " +
+                        "'mood' = AI semantic search + play by mood (mood param required). " +
+                        "'search' = search by keyword or natural language (query param). " +
+                        "'play'/'pause'/'stop'/'resume'/'skipnext'/'skipprev' = playback control. " +
+                        "'shuffle'/'library' = random library track.",
+                },
+                mood: {
+                    type: "string",
+                    enum: ["happy", "sad", "energetic", "chill", "romantic", "nostalgic",
+                           "intense", "dark", "upbeat"],
+                    description: "Mood for semantic music search (used with action='mood').",
+                },
+                query: {
+                    type: "string",
+                    description: "Search query or natural language description (e.g. 'pumping gym music', 'dinner party vibes'). Used with action='search' or action='mood'.",
+                },
+                volume: {
+                    type: "number",
+                    minimum: 0,
+                    maximum: 100,
+                    description: "Volume level 0–100. Used with action='play' (to set volume while playing).",
+                },
+                limit: {
+                    type: "number",
+                    minimum: 1,
+                    maximum: 20,
+                    default: 5,
+                    description: "Max number of results for search/mood actions.",
+                },
+            },
+            required: ["action"],
+        },
+        action: async ({ action, mood, query, volume, limit = 5 }) => {
+            const moodMap = {
+                happy: "upbeat cheerful feel-good",
+                sad: "melancholic emotional",
+                energetic: "high energy pump it",
+                chill: "relaxed chill lofi downtempo",
+                intense: "dark heavy aggressive",
+                romantic: "romantic love ballads",
+                nostalgic: "90s 2000s throwback",
+                dark: "dark moody atmospheric",
+                upbeat: "upbeat energetic positive",
+            };
+
+            if (action === "nowplaying" || action === "status") {
+                const s = await refreshStatus();
+                if (!s?.track) return "Nothing is currently playing.";
+                const t = s.track;
+                return `Now playing: "${t.title}" by ${t.artist} — ${t.album} [${s.state || "playing"}]`;
+            }
+
+            if (action === "play" || action === "pause" || action === "stop" ||
+                action === "resume" || action === "skipnext" || action === "skipprev") {
+                await doControl(action === "skipnext" ? "skipnext" :
+                               action === "skipprev" ? "skipprev" : action);
+                const s = await refreshStatus();
+                if (!s?.track) return `Sent '${action}' — nothing playing.`;
+                const t = s.track;
+                return `♪ ${t.title} by ${t.artist}`;
+            }
+
+            if (action === "mood") {
+                const desc = moodMap[mood] || mood || query || "moody atmospheric";
+                const semRes = await apiFetch(`/semantic?q=${encodeURIComponent(desc)}&limit=${limit}`);
+                if (!semRes?.data?.tracks?.length) return `No tracks found for mood: ${mood}.`;
+                const pick = semRes.data.tracks[0];
+                await playTrack(pick.ratingKey);
+                return `♪ Playing [${mood}]: "${pick.title}" by ${pick.artist} — ${pick.album || ""}`;
+            }
+
+            if (action === "search" && query) {
+                const semanticTriggers = /^(play|find|music|songs|tracks|something|put on|i want|i feel|lets hear|play me|lists?)/i;
+                const useSemantic = semanticTriggers.test(query);
+                const path = useSemantic
+                    ? `/semantic?q=${encodeURIComponent(query)}&limit=${limit}`
+                    : `/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+                const res = await apiFetch(path);
+                if (!res?.data?.tracks?.length) return `No tracks found for: ${query}.`;
+                const pick = res.data.tracks[0];
+                await playTrack(pick.ratingKey);
+                const label = useSemantic ? "AI match" : "Search match";
+                return `${label} → "${pick.title}" by ${pick.artist}`;
+            }
+
+            if (action === "shuffle" || action === "library") {
+                const res = await apiFetch("/library?limit=30");
+                if (!res?.data?.tracks?.length) return "Library unavailable.";
+                const pick = res.data.tracks[Math.floor(Math.random() * res.data.tracks.length)];
+                await playTrack(pick.ratingKey);
+                return `♪ Shuffle: "${pick.title}" by ${pick.artist}`;
+            }
+
+            if (action === "volume" && volume !== undefined) {
+                await doVolume(clamp(volume, 0, 100));
+                return `Volume set to ${volume}.`;
+            }
+
+            return `DJ Eva: unknown action '${action}'. Try: nowplaying, play, pause, stop, skipnext, mood [happy|sad|energetic|chill|romantic], search [query].`;
+        },
+        formatMessage: ({ action, mood, query }) => {
+            if (action === "nowplaying" || action === "status") return "Checking what's playing…";
+            if (action === "mood") return `Finding ${mood || query} music…`;
+            if (action === "search") return `Searching: ${query}…`;
+            if (action === "shuffle" || action === "library") return "Shuffling library…";
+            return `DJ Eva: ${action}…`;
+        },
+    });
+
+    console.info("[DJ-Eva] Function tool registered");
+}
+
 // ── Utilities ────────────────────────────────────────────────────────────────
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
@@ -781,6 +927,7 @@ jQuery(async () => {
     renderMainPanel();
     bindEvents();
     registerSlashCommands();
+    registerFunctionTools();
     await refreshStatus();
     await loadLibrary();
     console.info("[DJ-Eva] Initialized");
