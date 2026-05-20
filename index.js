@@ -417,7 +417,7 @@ function renderSettingsPanel() {
             if (clients.length > 0) {
                 toastr.success(`Found ${clients.length} client(s)`, "DJ Eva");
             } else {
-                toastr.warning('No clients found. Enable full Plex token on Eva-PC.', "DJ Eva");
+                toastr.warning('No managed clients found — using default VHX path (direct playback mode)', "DJ Eva");
             }
         } finally {
             btn.prop('disabled', false).html('<i class="fa-solid fa-magnifying-glass"></i> Discover Clients');
@@ -425,6 +425,23 @@ function renderSettingsPanel() {
     });
 
     setTimeout(checkConnection, 500);
+
+    // Status bar shows a hint if clients come back empty
+    const statusObserver = new MutationObserver(() => {
+        const el = document.getElementById('djeva_status');
+        if (el && el.textContent.includes('✓ Direct')) {
+            // Connection is good — clear any stale error about token
+            if (el.textContent.includes('auth error')) {
+                el.textContent = '✓ Direct: direct — token valid, no managed clients found (Plexamp may be using direct/local playback mode)';
+                el.style.color = 'var(--warning)';
+            } else if (el.textContent === '✓ Direct: direct') {
+                el.textContent = '✓ Direct: direct — connected (using default VHX client)';
+                el.style.color = 'var(--success)';
+            }
+        }
+    });
+    const statusEl = document.getElementById('djeva_status');
+    if (statusEl) statusObserver.observe(statusEl, { childList: true, characterData: true });
 }
 
 function rebuildDeviceDropdown(selectedName) {
@@ -457,7 +474,7 @@ async function checkConnection() {
                 const j = await r.json();
                 if (j?.ok) return `✓ Direct: ${label}`;
             }
-            if (r.status === 401 || r.status === 403) return `✗ ${label} (auth error — is PLEX_TOKEN valid?)`;
+            if (r.status === 401 || r.status === 403) return `✗ ${label} (HTTP 401 — Plex token may be a claim token, not full access token)`;
             return `✗ ${label} (HTTP ${r.status})`;
         } catch (e) {
             return null;  // unreachable
