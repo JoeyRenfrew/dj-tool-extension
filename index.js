@@ -2,19 +2,27 @@
  * Extension-DJEva — SillyTavern UI Extension
  * DJ Eva: Plexamp control with semantic (FAISS) search via /dj slash commands.
  *
- * The extension calls the DJ API on Eva-PC (http://100.120.54.7:38250)
- * instead of running Plexapi directly. This keeps secrets and the heavy
- * lifting on the server and keeps the SillyTavern install clean.
+ * Settings panel lets you configure:
+ *   - API URL: the base URL of the DJ API server (Eva-PC)
+ *   - Use Proxy: route through SillyTavern's /proxy to avoid mixed-content blocks
  *
  * Author: Joe Armella
  * License: AGPL-3.0
  */
 
-// ── Constants ────────────────────────────────────────────────────────────────
+import { extension_settings } from '../../../extensions.js';
+import { saveSettingsDebounced } from '../../../../script.js';
+import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
+import { ARGUMENT_TYPE, SlashCommandArgument, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import { SlashCommandEnumValue } from '../../../slash-commands/SlashCommandEnumValue.js';
+import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 
-const API = "http://100.120.54.7:38250/api/dj";
-const EXT  = "dj-eva";
-const FOLDER = `scripts/extensions/third-party/${EXT}`;
+// ── Default settings ─────────────────────────────────────────────────────────
+
+const defaultSettings = {
+    apiUrl: 'http://100.120.54.7:38250',
+    useProxy: true,
+};
 
 // ── State ────────────────────────────────────────────────────────────────────
 
@@ -22,10 +30,26 @@ let currentStatus = { state: "idle", playing: false, track: null };
 let suggestCache  = [];
 let isLoading     = false;
 
+// ── API URL resolver ─────────────────────────────────────────────────────────
+
+function getApiBase() {
+    if (extension_settings.djeva?.useProxy && window.location.origin) {
+        // SillyTavern's built-in proxy: https://host/proxy/http://target
+        // This avoids mixed-content blocking when ST is served over HTTPS
+        return window.location.origin + '/proxy' + extension_settings.djeva.apiUrl;
+    }
+    return extension_settings.djeva?.apiUrl || defaultSettings.apiUrl;
+}
+
+function addSlash(url) {
+    return url.endsWith('/') ? url : url + '/';
+}
+
 // ── API helpers ──────────────────────────────────────────────────────────────
 
 async function apiFetch(path, opts = {}) {
-    const url = `${API}${path}`;
+    const base = addSlash(getApiBase());
+    const url = base + 'api/dj' + path;  // path starts with /
     try {
         const r = await fetch(url, {
             headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
@@ -202,213 +226,96 @@ function escHtml(s) {
     return d.innerHTML;
 }
 
-// ── Slash Commands ───────────────────────────────────────────────────────────
+// ── Settings panel ───────────────────────────────────────────────────────────
 
-function registerSlashCommands() {
-    if (typeof SlashCommandParser === "undefined") return;
-
-    SlashCommandParser.addCommandObject(
-        SlashCommand.fromProps({
-            name: "dj",
-            aliases: ["music", "play"],
-            callback: async (namedArgs, unnamedArgs) => {
-                const query    = unnamedArgs.join(" ").trim();
-                const action   = (namedArgs.action || "").toLowerCase();
-                const key      = namedArgs.key || namedArgs.track;
-                const volLevel = namedArgs.volume ?? namedArgs.level;
-                const mood     = namedArgs.mood;
-                const mode     = (namedArgs.mode || "auto").toLowerCase();
-                const limit    = parseInt(namedArgs.limit || "10", 10);
-
-                // Direct actions
-                if (action === "pause" || action === "stop" || action === "skipnext" ||
-                    action === "skipprev" || action === "resume" || action === "next" ||
-                    action === "prev") {
-                    await doControl(action === "skipnext" ? "skipnext" :
-                                   action === "skipprev" ? "skipprev" : action);
-                    return;
-                }
-
-                // Volume
-                if (volLevel !== undefined) {
-                    await doVolume(clamp(+volLevel, 0, 100));
-                    return `Volume set to ${volLevel}.`;
-                }
-
-                // Play by key
-                if (key) {
-                    await playTrack(key);
-                    return;
-                }
-
-                // Library shuffle
-                if (action === "library" || action === "shuffle" || action === "random") {
-                    const res = await apiFetch("/library?limit=30");
-                    if (!res?.data?.tracks?.length) return "Library unavailable.";
-                    const pick = res.data.tracks[Math.floor(Math.random() * res.data.tracks.length)];
-                    await playTrack(pick.ratingKey);
-                    return `Playing: ${pick.title} — ${pick.artist}`;
-                }
-
-                // Mood-based semantic search
-                if (mood) {
-                    const moodMap = {
-                        happy: "upbeat cheerful feel-good",
-                        sad: "melancholic emotional",
-                        energetic: "high energy pump it",
-                        chill: "relaxed chill lofi downtempo",
-                        intense: "dark heavy aggressive",
-                        romantic: "romantic love ballads",
-                        nostalgic: "90s 2000s throwback",
-                    };
-                    const desc = moodMap[mood] || mood;
-                    const semRes = await apiFetch(`/semantic?q=${encodeURIComponent(desc)}&limit=5`);
-                    if (!semRes?.data?.tracks?.length) return `No tracks found for mood: ${mood}`;
-                    const pick = semRes.data.tracks[0];
-                    await playTrack(pick.ratingKey);
-                    return `Playing (${mood}): ${pick.title} — ${pick.artist}`;
-                }
-
-                // Natural language / semantic search
-                if (query) {
-                    // Auto-detect semantic vs keyword: if the query sounds like a description,
-                    // use semantic. Otherwise keyword. Or respect explicit mode=.
-                    const semanticTriggers = /^(play|find|music|songs|tracks|something|put on|i want|i feel|i need|lists|music for)/i;
-                    const useSemantic = mode === "semantic" || (mode === "auto" && semanticTriggers.test(query));
-                    const path = useSemantic
-                        ? `/semantic?q=${encodeURIComponent(query)}&limit=${limit}`
-                        : `/search?q=${encodeURIComponent(query)}&limit=${limit}`;
-                    const res = await apiFetch(path);
-                    if (!res?.data?.tracks?.length) {
-                        return `No tracks found for: ${query}`;
-                    }
-                    const t = res.data.tracks[0];
-                    await playTrack(t.ratingKey);
-                    const label = useSemantic ? "Semantic" : "Keyword";
-                    return `${label} match → ${t.title} — ${t.artist}`;
-                }
-
-                // Nothing: return help
-                return `<b>DJ Eva — /dj</b>
-<div>/dj play &lt;query&gt; — search + play</div>
-<div>/dj &lt;natural language&gt; — semantic search + play</div>
-<div>/dj play key=&lt;key&gt; — play by Plex key</div>
-<div>/dj pause|stop|skipnext|resume</div>
-<div>/dj volume level=80</div>
-<div>/dj mood happy|sad|energetic|chill|intense|romantic|nostalgic</div>
-<div>/dj mode=semantic|keyword</div>
-<div>/dj library — random tracks</div>`;
-            },
-            returns: "DJ action result or track list",
-            namedArgumentList: [
-                SlashCommandNamedArgument.fromProps({
-                    name: "action",
-                    description: "Action: play, pause, stop, skipnext, skipprev, resume, library, shuffle, random",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                    enumList: ["play", "pause", "stop", "skipnext", "skipprev", "resume", "next", "prev", "library", "shuffle", "random"],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "key",
-                    description: "Plex ratingKey or /library/metadata/… path",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "track",
-                    description: "Alternate key field",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "volume",
-                    description: "Volume level 0-100",
-                    typeList: [ARGUMENT_TYPE.NUMBER],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "level",
-                    description: "Volume level (alias)",
-                    typeList: [ARGUMENT_TYPE.NUMBER],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "mood",
-                    description: "Mood filter: happy, sad, energetic, chill, intense, romantic, nostalgic",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                    enumList: ["happy", "sad", "energetic", "chill", "intense", "romantic", "nostalgic"],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "mode",
-                    description: "Search mode: semantic (AI) or keyword ( Plex default)",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                    enumList: ["semantic", "keyword", "auto"],
-                }),
-                SlashCommandNamedArgument.fromProps({
-                    name: "limit",
-                    description: "Max results (default 10)",
-                    typeList: [ARGUMENT_TYPE.NUMBER],
-                    defaultValue: "10",
-                }),
-            ],
-            unnamedArgumentList: [
-                SlashCommandArgument.fromProps({
-                    description: "Search query or natural-language request",
-                    typeList: [ARGUMENT_TYPE.STRING],
-                    isRequired: false,
-                }),
-            ],
-            helpString: `
-<div><b>DJ Eva — Plexamp Control</b></div>
-<div>Use natural language or keywords to search your Plex library.</div>
-<br/>
-<div><b>Examples:</b></div>
-<ul>
-  <li><code>/dj play pumping music</code></li>
-  <li><code>/dj driving at night songs</code></li>
-  <li><code>/dj mode=semantic i need something chill to study to</code></li>
-  <li><code>/dj mood energetic</code></li>
-  <li><code>/dj library</code></li>
-  <li><code>/dj volume level=60</code></li>
-</ul>`,
-        })
-    );
-
-    // Secondary /nowplaying
-    SlashCommandParser.addCommandObject(
-        SlashCommand.fromProps({
-            name: "nowplaying",
-            aliases: ["np"],
-            callback: async () => {
-                const s = await refreshStatus();
-                if (!s?.track) return "Nothing playing.";
-                const t = s.track;
-                return `Now playing: ${t.title} — ${t.artist} (${t.album})`;
-            },
-            returns: "Current track",
-            helpString: "<div><b>/nowplaying</b> — show what's playing on Plexamp</div>",
-        })
-    );
-}
-
-// ── Settings panel: render ───────────────────────────────────────────────────
-
-async function renderPanel() {
-    const { renderExtensionTemplateAsync } = SillyTavern.getContext();
-    try {
-        const html = await renderExtensionTemplateAsync(`third-party/${EXT}`, "settings");
-        $("#extensions_settings2").append(html);
-    } catch (e) {
-        // Fallback: inline render if template unavailable
-        console.warn("[DJ-Eva] Template render failed, using inline HTML:", e);
-        $("#extensions_settings2").append(getInlinePanelHTML());
-    }
-    bindEvents();
-    refreshStatus();
-    loadLibrary();
-}
-
-function getInlinePanelHTML() {
-    return `
-    <div class="djeva-panel">
+function renderSettingsPanel() {
+    const html = `
+    <div class="djeva_settings">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
                 <b>🎧 DJ Eva</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <div>
+                    <label for="djeva_api_url">DJ API URL</label>
+                    <div><small>The base URL of Eva's DJ API server (e.g. http://100.120.54.7:38250)</small></div>
+                    <input id="djeva_api_url" class="text_pole" type="text" placeholder="${defaultSettings.apiUrl}" />
+                </div>
+                <div>
+                    <label class="checkbox_label for="djeva_use_proxy">
+                        <input id="djeva_use_proxy" type="checkbox" />
+                        <span>Use SillyTavern proxy</span>
+                        <a rel="noopener" href="https://docs.sillytavern.app/usage/proxy/" class="notes-link" target="_blank">
+                            <span class="note-link-span">?</span>
+                        </a>
+                    </label>
+                    <div><small>Enable this if SillyTavern is served over HTTPS and the API is HTTP. Routes requests through SillyTavern's built-in proxy to avoid mixed-content blocking.</small></div>
+                </div>
+                <div class="djeva-status-bar">
+                    <span id="djeva_status" class="djeva_muted">Checking connection…</span>
+                </div>
+            </div>
+        </div>
+    </div>`;
+
+    const extensionContainer = document.getElementById('djeva_settings_container') ?? document.getElementById('extensions_settings');
+    $(extensionContainer).append(html);
+
+    // Populate from settings
+    if (extension_settings.djeva === undefined) {
+        extension_settings.djeva = {};
+    }
+    for (const key in defaultSettings) {
+        if (extension_settings.djeva[key] === undefined) {
+            extension_settings.djeva[key] = defaultSettings[key];
+        }
+    }
+
+    $('#djeva_api_url').val(extension_settings.djeva.apiUrl).on('input', function () {
+        extension_settings.djeva.apiUrl = String($(this).val());
+        saveSettingsDebounced();
+        checkConnection();
+    });
+
+    $('#djeva_use_proxy').prop('checked', extension_settings.djeva.useProxy).on('change', function () {
+        extension_settings.djeva.useProxy = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    // Initial connection check
+    setTimeout(checkConnection, 500);
+}
+
+async function checkConnection() {
+    const el = document.getElementById('djeva_status');
+    if (!el) return;
+    const base = addSlash(getApiBase());
+    const url = base + 'api/dj/ping';
+    try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(4000) });
+        if (r.ok) {
+            const j = await r.json();
+            el.textContent = j?.ok ? `✓ Connected — ${j.ts}` : '✗ Unexpected response';
+            el.style.color = 'var(--success)';
+        } else {
+            el.textContent = `✗ HTTP ${r.status}`;
+            el.style.color = 'var(--error)';
+        }
+    } catch (e) {
+        el.textContent = `✗ ${e.message || 'Unreachable'}`;
+        el.style.color = 'var(--error)';
+    }
+}
+
+// ── Main panel (now-playing, controls, search) ───────────────────────────────
+
+function renderMainPanel() {
+    const html = `
+    <div class="djeva_main">
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>🎶 DJ Eva — Plexamp</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
@@ -479,17 +386,14 @@ function getInlinePanelHTML() {
             </div>
         </div>
     </div>`;
+
+    const extensionContainer = document.getElementById('djeva_main_container') ?? document.getElementById('extensions_settings2');
+    $(extensionContainer).append(html);
 }
 
 // ── Event bindings ───────────────────────────────────────────────────────────
 
 function bindEvents() {
-    // If the inline HTML was injected directly (no template render), we still
-    // need to bind. Use delegation on the panel container.
-    const $panel = $("#djeva-panel-root").length
-        ? $("#djeva-panel-root")
-        : $(".djeva-panel");
-
     // Playback controls
     $(document).on("click", "#djeva_play",  () => doControl("play"));
     $(document).on("click", "#djeva_pause", () => doControl("pause"));
@@ -514,7 +418,6 @@ function bindEvents() {
         } else if (mode === "semantic") {
             await doSearch(q, "semantic");
         } else {
-            // auto: detect
             await doSearch(q, "auto");
         }
     });
@@ -529,7 +432,6 @@ function bindEvents() {
     $(document).on("click", ".djeva-mood-btn", async e => {
         const mood = $(e.currentTarget).data("mood");
         if (!mood) return;
-        toastr.info(`Mood: ${mood}`, "DJ Eva");
         const moodMap = {
             happy: "upbeat cheerful feel-good",
             sad: "melancholic emotional",
@@ -549,10 +451,11 @@ function bindEvents() {
             toastr.warning(`No tracks for mood: ${mood}`, "DJ Eva");
             return;
         }
+        toastr.success(`${mood} → ${res.data.tracks[0].title}`, "DJ Eva");
         renderResults(res.data.tracks, "semantic");
     });
 
-    // Play result button (delegated)
+    // Play result button
     $(document).on("click", ".djeva-play-btn", async e => {
         const key = $(e.currentTarget).data("key");
         if (key) await playTrack(key);
@@ -560,6 +463,178 @@ function bindEvents() {
 
     // Random library
     $(document).on("click", "#djeva_library_btn", loadLibrary);
+}
+
+// ── Slash Commands ───────────────────────────────────────────────────────────
+
+function registerSlashCommands() {
+    if (typeof SlashCommandParser === "undefined") return;
+
+    SlashCommandParser.addCommandObject(
+        SlashCommand.fromProps({
+            name: "dj",
+            aliases: ["music", "play"],
+            callback: async (namedArgs, unnamedArgs) => {
+                const query    = unnamedArgs.join(" ").trim();
+                const action   = (namedArgs.action || "").toLowerCase();
+                const key      = namedArgs.key || namedArgs.track;
+                const volLevel = namedArgs.volume ?? namedArgs.level;
+                const mood     = namedArgs.mood;
+                const mode     = (namedArgs.mode || "auto").toLowerCase();
+                const limit    = parseInt(namedArgs.limit || "10", 10);
+
+                if (action === "pause" || action === "stop" || action === "skipnext" ||
+                    action === "skipprev" || action === "resume" || action === "next" ||
+                    action === "prev") {
+                    await doControl(action === "skipnext" ? "skipnext" :
+                                   action === "skipprev" ? "skipprev" : action);
+                    return;
+                }
+
+                if (volLevel !== undefined) {
+                    await doVolume(clamp(+volLevel, 0, 100));
+                    return `Volume set to ${volLevel}.`;
+                }
+
+                if (key) {
+                    await playTrack(key);
+                    return;
+                }
+
+                if (action === "library" || action === "shuffle" || action === "random") {
+                    const res = await apiFetch("/library?limit=30");
+                    if (!res?.data?.tracks?.length) return "Library unavailable.";
+                    const pick = res.data.tracks[Math.floor(Math.random() * res.data.tracks.length)];
+                    await playTrack(pick.ratingKey);
+                    return `Playing: ${pick.title} — ${pick.artist}`;
+                }
+
+                if (mood) {
+                    const moodMap = {
+                        happy: "upbeat cheerful feel-good",
+                        sad: "melancholic emotional",
+                        energetic: "high energy pump it",
+                        chill: "relaxed chill lofi downtempo",
+                        intense: "dark heavy aggressive",
+                        romantic: "romantic love ballads",
+                        nostalgic: "90s 2000s throwback",
+                    };
+                    const desc = moodMap[mood] || mood;
+                    const semRes = await apiFetch(`/semantic?q=${encodeURIComponent(desc)}&limit=5`);
+                    if (!semRes?.data?.tracks?.length) return `No tracks found for mood: ${mood}`;
+                    const pick = semRes.data.tracks[0];
+                    await playTrack(pick.ratingKey);
+                    return `Playing (${mood}): ${pick.title} — ${pick.artist}`;
+                }
+
+                if (query) {
+                    const semanticTriggers = /^(play|find|music|songs|tracks|something|put on|i want|i feel|i need|lists|music for)/i;
+                    const useSemantic = mode === "semantic" || (mode === "auto" && semanticTriggers.test(query));
+                    const path = useSemantic
+                        ? `/semantic?q=${encodeURIComponent(query)}&limit=${limit}`
+                        : `/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+                    const res = await apiFetch(path);
+                    if (!res?.data?.tracks?.length) return `No tracks found for: ${query}`;
+                    const t = res.data.tracks[0];
+                    await playTrack(t.ratingKey);
+                    const label = useSemantic ? "Semantic" : "Keyword";
+                    return `${label} match → ${t.title} — ${t.artist}`;
+                }
+
+                return `<b>DJ Eva — /dj</b>
+<div>/dj play &lt;query&gt; — search + play</div>
+<div>/dj &lt;natural language&gt; — semantic search + play</div>
+<div>/dj key=&lt;key&gt; — play by Plex key</div>
+<div>/dj pause|stop|skipnext|resume</div>
+<div>/dj volume level=80</div>
+<div>/dj mood happy|sad|energetic|chill|intense|romantic|nostalgic</div>
+<div>/dj mode=semantic|keyword</div>
+<div>/dj library|shuffle — random tracks</div>`;
+            },
+            returns: "DJ action result or track list",
+            namedArgumentList: [
+                SlashCommandNamedArgument.fromProps({
+                    name: "action",
+                    description: "Action: play, pause, stop, skipnext, skipprev, resume, library, shuffle, random",
+                    typeList: [ARGUMENT_TYPE.STRING],
+                    enumList: ["play", "pause", "stop", "skipnext", "skipprev", "resume", "next", "prev", "library", "shuffle", "random"],
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: "key",
+                    description: "Plex ratingKey or /library/metadata/… path",
+                    typeList: [ARGUMENT_TYPE.STRING],
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: "track",
+                    description: "Alternate key field",
+                    typeList: [ARGUMENT_TYPE.STRING],
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: "volume",
+                    description: "Volume level 0-100",
+                    typeList: [ARGUMENT_TYPE.NUMBER],
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: "level",
+                    description: "Volume level (alias)",
+                    typeList: [ARGUMENT_TYPE.NUMBER],
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: "mood",
+                    description: "Mood filter: happy, sad, energetic, chill, intense, romantic, nostalgic",
+                    typeList: [ARGUMENT_TYPE.STRING],
+                    enumList: ["happy", "sad", "energetic", "chill", "intense", "romantic", "nostalgic"],
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: "mode",
+                    description: "Search mode: semantic (AI) or keyword (Plex default)",
+                    typeList: [ARGUMENT_TYPE.STRING],
+                    enumList: ["semantic", "keyword", "auto"],
+                }),
+                SlashCommandNamedArgument.fromProps({
+                    name: "limit",
+                    description: "Max results (default 10)",
+                    typeList: [ARGUMENT_TYPE.NUMBER],
+                    defaultValue: "10",
+                }),
+            ],
+            unnamedArgumentList: [
+                SlashCommandArgument.fromProps({
+                    description: "Search query or natural-language request",
+                    typeList: [ARGUMENT_TYPE.STRING],
+                    isRequired: false,
+                }),
+            ],
+            helpString: `
+<div><b>DJ Eva — Plexamp Control</b></div>
+<div>Use natural language or keywords to search your Plex library.</div>
+<br/>
+<div><b>Examples:</b></div>
+<ul>
+  <li><code>/dj play pumping music</code></li>
+  <li><code>/dj driving at night songs</code></li>
+  <li><code>/dj i need something chill to study to</code></li>
+  <li><code>/dj mood energetic</code></li>
+  <li><code>/dj library</code></li>
+  <li><code>/dj volume level=60</code></li>
+</ul>`,
+        })
+    );
+
+    SlashCommandParser.addCommandObject(
+        SlashCommand.fromProps({
+            name: "nowplaying",
+            aliases: ["np"],
+            callback: async () => {
+                const s = await refreshStatus();
+                if (!s?.track) return "Nothing playing.";
+                const t = s.track;
+                return `Now playing: ${t.title} — ${t.artist} (${t.album})`;
+            },
+            returns: "Current track",
+            helpString: "<div><b>/nowplaying</b> — show what's playing on Plexamp</div>",
+        })
+    );
 }
 
 // ── Utilities ────────────────────────────────────────────────────────────────
@@ -579,7 +654,11 @@ function debounce(fn, ms) {
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 jQuery(async () => {
-    await renderPanel();
+    renderSettingsPanel();
+    renderMainPanel();
+    bindEvents();
     registerSlashCommands();
-    console.info("[DJ-Eva] Initialized — API:", API);
+    await refreshStatus();
+    await loadLibrary();
+    console.info("[DJ-Eva] Initialized");
 });
