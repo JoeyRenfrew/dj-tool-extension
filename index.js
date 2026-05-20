@@ -715,6 +715,28 @@ function registerSlashCommands() {
                     return `Playing (${mood}): ${pick.title} — ${pick.artist}`;
                 }
 
+                // Single-word action commands: "/dj pause" or "/dj stop" → execute as control, not search
+                if (query && !mood && !action && !key) {
+                    const raw = query.toLowerCase().trim();
+                    if (/^(pause|stop|resume|skipnext|skipprev|next|prev|shuffle|library|random|nowplaying|np)$/.test(raw)) {
+                        if (raw === "shuffle" || raw === "library" || raw === "random") {
+                            const res = await apiFetch("/library?limit=30");
+                            if (!res?.data?.tracks?.length) return "Library unavailable.";
+                            const pick = res.data.tracks[Math.floor(Math.random() * res.data.tracks.length)];
+                            await playTrack(pick.ratingKey);
+                            return `Playing: ${pick.title} — ${pick.artist}`;
+                        }
+                        if (raw === "nowplaying" || raw === "np") {
+                            const s = await refreshStatus();
+                            if (!s?.track) return "Nothing is currently playing.";
+                            return `Now playing: "${s.track.title}" by ${s.track.artist}`;
+                        }
+                        await doControl(raw === "skipnext" ? "skipnext" :
+                                       raw === "skipprev" ? "skipprev" : raw);
+                        return;
+                    }
+                }
+
                 if (query) {
                     const semanticTriggers = /^(play|find|music|songs|tracks|something|put on|i want|i feel|i need|lists|music for)/i;
                     const useSemantic = mode === "semantic" || (mode === "auto" && semanticTriggers.test(query));
