@@ -663,7 +663,7 @@ function registerSlashCommands() {
             name: "dj",
             aliases: ["music", "play"],
             callback: async (namedArgs, unnamedArgs) => {
-                const query    = unnamedArgs.join(" ").trim();
+                const query    = Array.isArray(unnamedArgs) ? unnamedArgs.join(" ").trim() : (unnamedArgs || "").trim();
                 const action   = (namedArgs.action || "").toLowerCase();
                 const key      = namedArgs.key || namedArgs.track;
                 const volLevel = namedArgs.volume ?? namedArgs.level;
