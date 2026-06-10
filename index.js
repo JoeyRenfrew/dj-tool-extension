@@ -284,7 +284,7 @@ async function playTrack(key) {
 }
 
 // ── Play next (queue after current track) ────────────────────────────────────
-async function playNext(key) {
+async function queueNext(key) {
     const body = { ratingKey: String(key).split("/").pop() };
     const url    = extension_settings.djeva?.deviceUrl   || null;
     const clientId = extension_settings.djeva?.deviceId || null;
@@ -965,7 +965,7 @@ function registerFunctionTools() {
             },
             required: ["action"],
         },
-        action: async ({ action, mood, query, volume, limit = 5, playNext = false }) => {
+        action: async ({ action, mood, query, volume, limit = 5, playNext: playNextParam = false }) => {
             const moodMap = {
                 happy: "upbeat cheerful feel-good",
                 sad: "melancholic emotional",
@@ -1012,12 +1012,12 @@ function registerFunctionTools() {
                         return `No tracks found for mood: ${mood} (${desc}).`;
                     }
                     const pick = kTracks[0];
-                    if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
-                    return `♪ ${playNext ? "Queued next" : "Playing"} [${mood}] (keyword): "${pick.title}" by ${pick.artist}`;
+                    if (playNextParam) { await queueNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
+                    return `♪ ${playNextParam ? "Queued next" : "Playing"} [${mood}] (keyword): "${pick.title}" by ${pick.artist}`;
                 }
                 const pick = tracks[0];
-                if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
-                return `♪ ${playNext ? "Queued next" : "Playing"} [${mood}]: "${pick.title}" by ${pick.artist} — ${pick.album || ""}`;
+                if (playNextParam) { await queueNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
+                return `♪ ${playNextParam ? "Queued next" : "Playing"} [${mood}]: "${pick.title}" by ${pick.artist} — ${pick.album || ""}`;
             }
 
             if (action === "search" && query) {
@@ -1038,11 +1038,11 @@ function registerFunctionTools() {
                     const fTracks = fRes?.data?.tracks;
                     if (!fTracks || fTracks.length === 0) return `No tracks found for: ${query}.`;
                     const pick = fTracks[0];
-                    if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
+                    if (playNextParam) { await queueNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
                     return `Search match → "${pick.title}" by ${pick.artist}`;
                 }
                 const pick = tracks[0];
-                if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
+                if (playNextParam) { await queueNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
                 const label = useSemantic ? "AI match" : "Search match";
                 return `${label} → "${pick.title}" by ${pick.artist}`;
             }
@@ -1075,8 +1075,8 @@ function registerFunctionTools() {
                 // Play the best library match
                 const pick = suggestions.find(s => s.available && s.ratingKey);
                 if (pick) {
-                    if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
-                    return `♪ ${libraryMessage} ${playNext ? "Queued next" : "Playing"}: \"${pick.title}\" by ${pick.artist}.`;
+                    if (playNextParam) { await queueNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
+                    return `♪ ${libraryMessage} ${playNextParam ? "Queued next" : "Playing"}: \"${pick.title}\" by ${pick.artist}.`;
                 }
 
                 return libraryMessage || `Found ${totalInLibrary} track(s) for \"${query}\".`;
