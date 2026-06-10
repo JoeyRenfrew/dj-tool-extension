@@ -27,8 +27,8 @@ const defaultSettings = {
     apiUrl: 'http://100.120.54.7:38250',
     useProxy: false,
     deviceName: 'VHX',
-    deviceUrl: '',
-    deviceId: '',
+    deviceUrl: 'http://192.168.86.100:32500',
+    deviceId: '135bba4e-b108-4a53-b5d1-a23f930d3c67',
 };
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -145,9 +145,20 @@ async function refreshStatus() {
     const qs = url    ? `?client=${encodeURIComponent(url)}` : '';
     const cidQs = clientId ? `${qs ? '&' : '?'}clientId=${encodeURIComponent(clientId)}` : '';
     const res = await apiFetch("/status" + qs + cidQs);
-    if (!res) return;
+    if (!res) {
+        // API unreachable — show error in client indicator
+        const indicator = document.getElementById("djeva_client_indicator");
+        if (indicator) indicator.textContent = '⚠ API unreachable';
+        return;
+    }
     currentStatus = res.data || currentStatus;
     updateNowPlayingUI(currentStatus);
+    // Update client indicator
+    const indicator = document.getElementById("djeva_client_indicator");
+    if (indicator) {
+        const deviceName = extension_settings.djeva?.deviceName || 'VHX';
+        indicator.textContent = `🎵 on ${deviceName}`;
+    }
     return currentStatus;
 }
 
@@ -157,8 +168,10 @@ function updateNowPlayingUI(status) {
     const el = document.getElementById("djeva_nowplaying");
     const vol = document.getElementById("djeva_vol_pct");
     if (!el) return;
+
     if (!status?.track) {
-        el.innerHTML = '<span class="djeva_muted">Nothing playing</span>';
+        const deviceName = extension_settings.djeva?.deviceName || 'VHX';
+        el.innerHTML = `<span class="djeva_muted">Nothing playing</span><br><small style="color:var(--gray)">on ${escHtml(deviceName)}</small>`;
         return;
     }
     const t = status.track;
@@ -167,6 +180,8 @@ function updateNowPlayingUI(status) {
     const state   = status.state || "unknown";
     const elapsed = status.time ? fmtDuration(status.time) : "?";
     const total   = t.duration ? fmtDuration(t.duration * 1000) : "?";
+    // Show which client is active
+    const deviceName = extension_settings.djeva?.deviceName || 'VHX';
     el.innerHTML = `
         <div class="djeva-track">
             <div class="djeva-track-title">${escHtml(title)}</div>
@@ -175,6 +190,9 @@ function updateNowPlayingUI(status) {
         <div class="djeva-track-meta">
             <span class="djeva-badge djeva-state-${state}">${state}</span>
             ${elapsed} / ${total}
+            <button id="djeva_refresh_np" class="menu_button" style="padding:1px 4px;margin-left:4px;font-size:0.7rem" title="Refresh now playing">
+                <i class="fa-solid fa-rotate-right"></i>
+            </button>
         </div>
     `;
     if (vol) vol.textContent = status.volume ?? "?";
@@ -204,6 +222,9 @@ async function doSearch(query, mode = "keyword") {
     }
     suggestCache = res.data.tracks;
     renderResults(suggestCache);
+    // Show Play All bar when results exist
+    const bar = document.getElementById("djeva_playall_bar");
+    if (bar) bar.style.display = suggestCache.length > 0 ? "block" : "none";
 }
 
 function renderResults(tracks) {
@@ -259,6 +280,46 @@ async function playTrack(key) {
     if (res) {
         toastr.success(`▶ ${res.data?.track?.title || "Track"}`, "DJ Eva");
         setTimeout(refreshStatus, 500);
+    }
+}
+
+// ── Play next (queue after current track) ────────────────────────────────────
+async function playNext(key) {
+    const body = { ratingKey: String(key).split("/").pop() };
+    const url    = extension_settings.djeva?.deviceUrl   || null;
+    const clientId = extension_settings.djeva?.deviceId || null;
+    if (url)    body.client    = url;
+    if (clientId) body.clientId = clientId;
+    const res = await apiFetch("/playnext", {
+        method: "POST",
+        body: JSON.stringify(body),
+    });
+    if (res) {
+        toastr.success(`⏭ ${res.data?.track?.title || "Queued next"}`, "DJ Eva");
+        setTimeout(refreshStatus, 500);
+    }
+}
+
+// ── Queue all results ─────────────────────────────────────────────────────────
+async function playAll() {
+    if (!suggestCache || suggestCache.length === 0) {
+        toastr.warning("No tracks in results to play", "DJ Eva");
+        return;
+    }
+    const url     = extension_settings.djeva?.deviceUrl   || null;
+    const clientId = extension_settings.djeva?.deviceId || null;
+    const body = {
+        ratingKeys: suggestCache.map(t => Number(String(t.ratingKey).split("/").pop()))
+    };
+    if (url)     body.client    = url;
+    if (clientId) body.clientId = clientId;
+    const res = await apiFetch("/queue", {
+        method: "POST",
+        body: JSON.stringify(body),
+    });
+    if (res) {
+        toastr.success(`▶ Queue: ${suggestCache.length} tracks`, "DJ Eva");
+        setTimeout(refreshStatus, 800);
     }
 }
 
@@ -525,6 +586,7 @@ function renderMainPanel() {
                 <div id="djeva_nowplaying" class="djeva-nowplaying">
                     <span class="djeva_muted">Loading…</span>
                 </div>
+                <div id="djeva_client_indicator" style="font-size:0.7rem; color:var(--gray); margin-bottom:4px"></div>
 
                 <!-- Playback controls -->
                 <div class="djeva-controls">
@@ -584,6 +646,13 @@ function renderMainPanel() {
                 <!-- Results list -->
                 <div id="djeva_results" class="djeva-results"></div>
 
+                <!-- Play All button -->
+                <div id="djeva_playall_bar" style="display:none; margin-top:4px">
+                    <button id="djeva_playall_btn" class="menu_button" style="width:100%">
+                        <i class="fa-solid fa-list"></i> Play All (Queue)
+                    </button>
+                </div>
+
             </div>
         </div>
     </div>`;
@@ -600,6 +669,7 @@ function bindEvents() {
     $(document).on("click", "#djeva_stop",  () => doControl("stop"));
     $(document).on("click", "#djeva_next",  () => doControl("skipnext"));
     $(document).on("click", "#djeva_prev",  () => doControl("skipprev"));
+    $(document).on("click", "#djeva_playall_btn", () => playAll());
 
     $(document).on("input", "#djeva_volume", debounce(async e => {
         const lvl = parseInt($(e.target).val(), 10);
@@ -651,6 +721,7 @@ function bindEvents() {
     });
 
     $(document).on("click", "#djeva_library_btn", loadLibrary);
+    $(document).on("click", "#djeva_refresh_np", () => refreshStatus());
 }
 
 // ── Slash Commands ───────────────────────────────────────────────────────────
@@ -886,10 +957,15 @@ function registerFunctionTools() {
                     default: 5,
                     description: "Max number of results for search/mood actions.",
                 },
+                playNext: {
+                    type: "boolean",
+                    default: false,
+                    description: "If true, add to queue after current track instead of switching immediately. Default false.",
+                },
             },
             required: ["action"],
         },
-        action: async ({ action, mood, query, volume, limit = 5 }) => {
+        action: async ({ action, mood, query, volume, limit = 5, playNext = false }) => {
             const moodMap = {
                 happy: "upbeat cheerful feel-good",
                 sad: "melancholic emotional",
@@ -936,12 +1012,12 @@ function registerFunctionTools() {
                         return `No tracks found for mood: ${mood} (${desc}).`;
                     }
                     const pick = kTracks[0];
-                    await playTrack(pick.ratingKey);
-                    return `♪ Playing [${mood}] (keyword): "${pick.title}" by ${pick.artist}`;
+                    if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
+                    return `♪ ${playNext ? "Queued next" : "Playing"} [${mood}] (keyword): "${pick.title}" by ${pick.artist}`;
                 }
                 const pick = tracks[0];
-                await playTrack(pick.ratingKey);
-                return `♪ Playing [${mood}]: "${pick.title}" by ${pick.artist} — ${pick.album || ""}`;
+                if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
+                return `♪ ${playNext ? "Queued next" : "Playing"} [${mood}]: "${pick.title}" by ${pick.artist} — ${pick.album || ""}`;
             }
 
             if (action === "search" && query) {
@@ -962,11 +1038,11 @@ function registerFunctionTools() {
                     const fTracks = fRes?.data?.tracks;
                     if (!fTracks || fTracks.length === 0) return `No tracks found for: ${query}.`;
                     const pick = fTracks[0];
-                    await playTrack(pick.ratingKey);
+                    if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
                     return `Search match → "${pick.title}" by ${pick.artist}`;
                 }
                 const pick = tracks[0];
-                await playTrack(pick.ratingKey);
+                if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
                 const label = useSemantic ? "AI match" : "Search match";
                 return `${label} → "${pick.title}" by ${pick.artist}`;
             }
@@ -999,8 +1075,8 @@ function registerFunctionTools() {
                 // Play the best library match
                 const pick = suggestions.find(s => s.available && s.ratingKey);
                 if (pick) {
-                    await playTrack(pick.ratingKey);
-                    return `♪ ${libraryMessage} Playing: \"${pick.title}\" by ${pick.artist}.`;
+                    if (playNext) { await playNext(pick.ratingKey); } else { await playTrack(pick.ratingKey); }
+                    return `♪ ${libraryMessage} ${playNext ? "Queued next" : "Playing"}: \"${pick.title}\" by ${pick.artist}.`;
                 }
 
                 return libraryMessage || `Found ${totalInLibrary} track(s) for \"${query}\".`;
@@ -1042,6 +1118,13 @@ function debounce(fn, ms) {
     return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
 }
 
+// ── Periodic refresh ───────────────────────────────────────────────────────
+let _npTimer = null;
+function startNowPlayingRefresh(intervalMs = 30000) {
+    if (_npTimer) clearInterval(_npTimer);
+    _npTimer = setInterval(refreshStatus, intervalMs);
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 jQuery(async () => {
@@ -1052,5 +1135,6 @@ jQuery(async () => {
     registerFunctionTools();
     await refreshStatus();
     await loadLibrary();
+    startNowPlayingRefresh(30000);
     console.info("[DJ-Eva] Initialized");
 });
