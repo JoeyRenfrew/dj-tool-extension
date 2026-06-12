@@ -24,11 +24,11 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 // ── Default settings ─────────────────────────────────────────────────────────
 
 const defaultSettings = {
-    apiUrl: '',
+    apiUrl: 'https://truenas-scale.tail7119fb.ts.net:30022/api/dj/',
     useProxy: false,
-    deviceName: 'VHX',
-    deviceUrl: 'http://192.168.86.100:32500',
-    deviceId: '135bba4e-b108-4a53-b5d1-a23f930d3c67',
+    deviceName: 'Android',
+    deviceUrl: '',
+    deviceId: '',
 };
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -401,7 +401,7 @@ function renderSettingsPanel() {
             <div class="inline-drawer-content">
                 <div>
                     <label for="djeva_api_url">DJ API URL</label>
-                    <div><small>Eva-PC's DJ API server base URL</small></div>
+                    <div><small>Your nginx proxy URL for the DJ API, e.g. https://your-host/dj/. Same-origin avoids CORS issues.</small></div>
                     <input id="djeva_api_url" class="text_pole" type="text" placeholder="${defaultSettings.apiUrl}" />
                 </div>
                 <div>
