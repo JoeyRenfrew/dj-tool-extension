@@ -24,7 +24,7 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 // ── Default settings ─────────────────────────────────────────────────────────
 
 const defaultSettings = {
-    apiUrl: 'https://truenas-scale.tail7119fb.ts.net:30022/api/dj/',
+    apiUrl: 'https://truenas-scale.tail7119fb.ts.net:30022',
     useProxy: false,
     deviceName: 'Android',
     deviceUrl: '',
