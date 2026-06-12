@@ -25,7 +25,7 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 
 const defaultSettings = {
     apiUrl: 'http://100.120.54.7:38250',
-    useProxy: false,
+    useProxy: true,
     deviceName: 'VHX',
     deviceUrl: 'http://192.168.86.100:32500',
     deviceId: '135bba4e-b108-4a53-b5d1-a23f930d3c67',
