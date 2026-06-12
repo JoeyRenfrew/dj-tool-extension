@@ -53,20 +53,11 @@ function addSlash(url) {
     return url.endsWith('/') ? url : url + '/';
 }
 
-function getProxyBase() {
-    // Always try proxy if direct fails
-    const direct = extension_settings.djeva?.apiUrl || defaultSettings.apiUrl;
-    return window.location.origin + '/proxy' + direct;
-}
-
-// ── Fetch with fallback: try direct, then proxy ─────────────────────────────
+// ── Fetch — direct only, no proxy ──────────────────────────────────────────
 
 async function apiFetch(path, opts = {}) {
     const directBase = addSlash(extension_settings.djeva?.apiUrl || defaultSettings.apiUrl);
-    const proxyBase  = addSlash(getProxyBase());
-
     const directUrl = directBase + 'api/dj' + path;
-    const proxyUrl  = proxyBase  + 'api/dj' + path;
 
     async function tryFetch(url) {
         const r = await fetch(url, {
@@ -103,36 +94,9 @@ async function apiFetch(path, opts = {}) {
         console.warn("[DJ-Eva] Direct fetch failed, trying proxy:", e.message);
     }
 
-    // ── NEVER use SillyTavern proxy for state-changing requests ─────────────────
-    // When nginx is the proxy (same-origin mode), proxy mode is disabled.
-    const isMutation = opts.method === "POST" || opts.method === "PUT" || opts.method === "DELETE";
-    if (isMutation && !extension_settings.djeva?.useProxy) {
-        // Proxy explicitly disabled — fail immediately on mutation errors
-        const action = opts.body ? JSON.parse(opts.body).action || opts.body : "action";
-        console.error("[DJ-Eva] POST failed:", directUrl, action);
-        return null;
-    }
-
-    // GET requests: try direct, fall back to proxy on network failure
-    // ── Proxy fallback for GET only ────────────────────────────────────────────────
-    try {
-        const r = await tryFetch(proxyUrl);
-        if (r.ok) {
-            const j = await r.json();
-            if (!j.ok) {
-                toastr.error(j.error || "DJ API error", "DJ Eva");
-                return null;
-            }
-            return j;
-        } else {
-            const j = await r.json().catch(() => ({}));
-            toastr.error(j?.error || `Proxy error: HTTP ${r.status}`, "DJ Eva");
-            return null;
-        }
-    } catch (e) {
-        toastr.error(`DJ API unreachable: ${e.message}`, "DJ Eva");
-        return null;
-    }
+    // ── Direct fetch failed, no proxy fallback — just log ───────────────────────
+    console.error("[DJ-Eva] Request failed:", directUrl, opts);
+    return null;
 }
 
 // ── Refresh now-playing ──────────────────────────────────────────────────────
@@ -414,13 +378,6 @@ function renderSettingsPanel() {
                         <i class="fa-solid fa-magnifying-glass"></i> Discover Clients
                     </button>
                 </div>
-                <div>
-                    <label class="checkbox_label">
-                        <input id="djeva_use_proxy" type="checkbox" />
-                        <span>Use SillyTavern proxy</span>
-                    </label>
-                    <div><small>Enable this when ST is served over HTTPS and the API is on HTTP. Routes through ST's built-in proxy to avoid mixed-content blocking. Auto-enabled if direct connection fails.</small></div>
-                </div>
                 <div class="djeva-status-bar">
                     <span id="djeva_status" class="djeva_muted">—</span>
                 </div>
@@ -480,10 +437,11 @@ function renderSettingsPanel() {
         try {
             const clients = await discoverClients();
             rebuildDeviceDropdown(extension_settings.djeva.deviceName || 'VHX');
+            const el = document.getElementById('djeva_status');
             if (clients.length > 0) {
-                toastr.success(`Found ${clients.length} client(s)`, "DJ Eva");
+                if (el) el.textContent = `✓ ${clients.length} client(s) found`;
             } else {
-                toastr.warning('No managed clients found — using default VHX path (direct playback mode)', "DJ Eva");
+                if (el) el.textContent = 'ℹ No managed clients — using auto-detect from active session';
             }
         } finally {
             btn.prop('disabled', false).html('<i class="fa-solid fa-magnifying-glass"></i> Discover Clients');
