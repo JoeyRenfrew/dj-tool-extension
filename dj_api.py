@@ -120,6 +120,20 @@ def get_music_section():
 # ── Flask app (must be before routes) ────────────────────────────────────────
 app = Flask(__name__)
 
+# Routes are defined at `/api/dj/...` but nginx strips the prefix.
+# Wrap the WSGI app to rewrite /path → /api/dj/path so both work.
+class PrefixMiddleware:
+    def __init__(self, app, prefix="/api/dj"):
+        self.app = app
+        self.prefix = prefix
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        if not path.startswith(self.prefix) and path != "/":
+            environ["PATH_INFO"] = self.prefix + path
+        return self.app(environ, start_response)
+
+app.wsgi_app = PrefixMiddleware(app.wsgi_app)
+
 @app.before_request
 def handle_options_preflight():
     """Handle ALL CORS preflight OPTIONS requests before route handlers run."""
