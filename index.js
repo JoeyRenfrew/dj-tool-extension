@@ -24,7 +24,7 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 // ── Default settings ─────────────────────────────────────────────────────────
 
 const defaultSettings = {
-    apiUrl: 'http://100.120.54.7:38250',
+    apiUrl: '',
     useProxy: true,
     deviceName: 'VHX',
     deviceUrl: 'http://192.168.86.100:32500',
@@ -530,7 +530,15 @@ async function checkConnection() {
     el.textContent = "Checking…";
     el.style.color = "";
 
-    const directBase = addSlash(extension_settings.djeva?.apiUrl || defaultSettings.apiUrl);
+    const baseUrl = extension_settings.djeva?.apiUrl || defaultSettings.apiUrl;
+    if (!baseUrl) {
+        // Same-origin mode — no need to probe, nginx handles it
+        el.textContent = '✓ Same-origin (nginx proxy)';
+        el.style.color = 'var(--success)';
+        return;
+    }
+
+    const directBase = addSlash(baseUrl);
     const directUrl  = directBase + 'api/dj/ping';
     const proxyBase  = addSlash(getProxyBase());
     const proxyUrl   = proxyBase  + 'api/dj/ping';
