@@ -25,7 +25,7 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 
 const defaultSettings = {
     apiUrl: '',
-    useProxy: true,
+    useProxy: false,
     deviceName: 'VHX',
     deviceUrl: 'http://192.168.86.100:32500',
     deviceId: '135bba4e-b108-4a53-b5d1-a23f930d3c67',
@@ -104,14 +104,12 @@ async function apiFetch(path, opts = {}) {
     }
 
     // ── NEVER use SillyTavern proxy for state-changing requests ─────────────────
-    // Joe's Spark PC and Eva-PC are on the same Tailscale tailnet — direct is always
-    // available, no mixed-content issues, and the ST proxy returns 403 on all POSTs.
+    // When nginx is the proxy (same-origin mode), proxy mode is disabled.
     const isMutation = opts.method === "POST" || opts.method === "PUT" || opts.method === "DELETE";
     if (isMutation && !extension_settings.djeva?.useProxy) {
-        // Proxy explicitly disabled AND this is a mutation — fail immediately, do NOT fall back to proxy
+        // Proxy explicitly disabled — fail immediately on mutation errors
         const action = opts.body ? JSON.parse(opts.body).action || opts.body : "action";
-        toastr.error(`Direct POST to DJ API failed (or unreachable). Check that Eva-PC is reachable at ${directUrl}`);
-        console.error("[DJ-Eva] Direct POST failed, not retrying via proxy (proxy is disabled):", action);
+        console.error("[DJ-Eva] POST failed:", directUrl, action);
         return null;
     }
 
