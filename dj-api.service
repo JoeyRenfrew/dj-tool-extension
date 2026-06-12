@@ -1,0 +1,23 @@
+[Unit]
+Description=DJ Eva Plexamp HTTP API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eva
+# ⚠️  Replace YOUR_REAL_PLEX_TOKEN with your actual Plex token
+# Find it at: https://app.plex.tv/authed-legacy-automation/ if you have an
+#automation account, or in a Plex app under Settings → Plex Web → View XML
+Environment="PLEX_TOKEN=YOUR_REAL_PLEX_TOKEN"
+ExecStart=/usr/bin/python3 /home/eva/music_dj/dj_api.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Optional resource limits (keep it light)
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

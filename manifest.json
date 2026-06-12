@@ -1,0 +1,12 @@
+{
+    "display_name": "DJ Eva — Plexamp",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Joe Armella",
+    "version": "0.1.0",
+    "homePage": "https://github.com/JoeyRenfrew/dj-tool-extension",
+    "auto_update": true
+}
