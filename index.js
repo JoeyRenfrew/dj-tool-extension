@@ -262,6 +262,30 @@ async function queueNext(key) {
     }
 }
 
+// ── Vibe → multi-track playlist session ───────────────────────────────────────
+async function playlistSession({ query, mood, limit = 12, shuffle = true, playNext = false }) {
+    const body = {
+        query: query || undefined,
+        mood: mood || undefined,
+        limit: Math.min(Math.max(Number(limit) || 12, 1), 30),
+        shuffle: shuffle !== false,
+        play: true,
+        playNext: !!playNext,
+        diversify: true,
+    };
+    const url = extension_settings.djeva?.deviceUrl || null;
+    const clientId = extension_settings.djeva?.deviceId || null;
+    if (url) body.client = url;
+    if (clientId) body.clientId = clientId;
+    const res = await apiFetch("/playlist-session", {
+        method: "POST",
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(45000),
+    });
+    if (res) setTimeout(refreshStatus, 500);
+    return res;
+}
+
 // ── Queue all results ─────────────────────────────────────────────────────────
 async function playAll() {
     if (!suggestCache || suggestCache.length === 0) {
@@ -886,10 +910,12 @@ function registerFunctionTools() {
                     type: "string",
                     enum: ["nowplaying", "status", "play", "pause", "stop", "resume",
                            "skipnext", "skipprev", "shuffle", "library", "mood", "search",
-                           "suggest"],
+                           "suggest", "playlist"],
                     description:
                         "Action to perform. 'nowplaying'/'status' = get current track. " +
-                        "'mood' = AI semantic search + play by mood (mood param required). " +
+                        "'mood' = AI semantic search + play one track by mood (mood param required). " +
+                        "'playlist' = AI semantic search + play a multi-track set from a vibe/query " +
+                        "(use playNext=true to queue after current track instead of hard-switching). " +
                         "'search' = search by keyword or natural language (query param). " +
                         "'suggest' = natural-language scene/vibe query → cross-check Joe's library, " +
                         "play best match, or suggest tracks to add. Best for roleplay music cues. " +
@@ -917,14 +943,15 @@ function registerFunctionTools() {
                 limit: {
                     type: "number",
                     minimum: 1,
-                    maximum: 20,
+                    maximum: 30,
                     default: 5,
-                    description: "Max number of results for search/mood actions.",
+                    description: "Max tracks for search/mood (default 5) or playlist (default 12 when action=playlist).",
                 },
                 playNext: {
                     type: "boolean",
                     default: false,
-                    description: "If true, add to queue after current track instead of switching immediately. Default false.",
+                    description: "If true, queue after the current track instead of switching immediately. " +
+                        "Works for mood/search/suggest (single track) and playlist (whole set). Default false.",
                 },
             },
             required: ["action"],
@@ -1011,6 +1038,35 @@ function registerFunctionTools() {
                 return `${label} → "${pick.title}" by ${pick.artist}`;
             }
 
+            if (action === "playlist") {
+                const desc = query || moodMap[mood] || mood;
+                if (!desc) {
+                    return "playlist requires query or mood — describe the vibe (e.g. 'chill coding', mood='chill').";
+                }
+                const trackLimit = Math.min(Math.max(limit || 12, 1), 30);
+                console.info(`[DJ-Eva] Playlist session: '${desc}' limit=${trackLimit} playNext=${playNextParam}`);
+                const res = await playlistSession({
+                    query,
+                    mood,
+                    limit: trackLimit,
+                    playNext: playNextParam,
+                });
+                if (!res) {
+                    return "Could not reach DJ API for playlist session. Check Eva-PC (systemctl status dj-api).";
+                }
+                const data = res.data || {};
+                const tracks = data.tracks || [];
+                if (!tracks.length) {
+                    return `No library tracks matched "${data.query || desc}".`;
+                }
+                const first = data.firstTrack || tracks[0];
+                const preview = tracks.slice(0, 5).map(t => `"${t.title}" — ${t.artist}`).join("; ");
+                const more = tracks.length > 5 ? ` (+${tracks.length - 5} more)` : "";
+                const mode = data.appended || playNextParam ? "Queued after current" : "Now playing";
+                return `${mode}: ${trackLimit}-track set for "${data.query || desc}". ` +
+                    `Starts with "${first.title}" by ${first.artist}. Set: ${preview}${more}.`;
+            }
+
             if (action === "suggest" && query) {
                 console.info(`[DJ-Eva] Suggest: '${query}'`);
                 const res = await apiFetch("/suggest", "POST", { query, limit });
@@ -1059,11 +1115,12 @@ function registerFunctionTools() {
                 return `Volume set to ${volume}.`;
             }
 
-            return `DJ Eva: unknown action '${action}'. Try: nowplaying, play, pause, stop, skipnext, mood [happy|sad|energetic|chill|romantic], search [query].`;
+            return `DJ Eva: unknown action '${action}'. Try: playlist, mood, search, suggest, nowplaying, play, pause, skipnext.`;
         },
         formatMessage: ({ action, mood, query }) => {
             if (action === "nowplaying" || action === "status") return "Checking what's playing…";
             if (action === "mood") return `Finding ${mood || query} music…`;
+            if (action === "playlist") return `Building playlist: ${query || mood || "vibe"}…`;
             if (action === "search") return `Searching: ${query}…`;
             if (action === "shuffle" || action === "library") return "Shuffling library…";
             return `DJ Eva: ${action}…`;

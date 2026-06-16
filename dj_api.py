@@ -14,6 +14,7 @@ import sqlite3
 import logging
 import socket
 import threading
+import random
 from datetime import datetime
 
 from flask import Flask, jsonify, request
@@ -40,16 +41,39 @@ log = logging.getLogger("dj_api")
 # ── Config ────────────────────────────────────────────────────────────────────
 PLEX_URL    = "http://100.65.48.19:32400"
 PLEX_TOKEN  = os.environ.get("PLEX_TOKEN", "STXcK326j1emKkEkPrek")
-VHX_URL     = "http://192.168.86.100:32500"
-VHX_MACHINE = "135bba4e-b108-4a53-b5d1-a23f930d3c67"
 
 DB_PATH     = "/home/eva/music_dj/music_library.db"
 FAISS_PATH  = "/home/eva/music_dj/music_vectors.faiss"
 ROWS_PATH   = "/home/eva/music_dj/raw_rows.pkl"
 API_PORT    = 38250
+PLEXAMP_PORT = 32500
+PLEXAMP_CONNECT_TIMEOUT = float(os.environ.get("PLEXAMP_CONNECT_TIMEOUT", "3"))
+PREFERRED_CLIENT = os.environ.get("PREFERRED_CLIENT", "auto").strip().lower()
 
-# ── LAN Plexamp Discovery ─────────────────────────────────────────────────────
-# Scans the local subnet for Plexamp instances listening on port 32500.
+# Registered playback targets (eva-pc is index/API only — no local Plexamp).
+CLIENT_REGISTRY = {
+    "android": {
+        "name": "Android",
+        "machineId": os.environ.get(
+            "CLIENT_ANDROID_MACHINE",
+            "b36d9adf-d9c9-40b6-981a-9f3531e741e6",
+        ),
+        "baseUrl": os.environ.get(
+            "CLIENT_ANDROID_URL",
+            "http://192.168.86.185:32500",
+        ),
+    },
+    "vectorhxai": {
+        "name": "VECTORHXAI",
+        "machineId": os.environ.get(
+            "CLIENT_VECTORHXAI_MACHINE",
+            os.environ.get("VHX_MACHINE", "135bba4e-b108-4a53-b5d1-a23f930d3c67"),
+        ),
+        "baseUrl": os.environ.get("CLIENT_VECTORHXAI_URL", ""),
+    },
+}
+
+# ── LAN Plexamp Discovery (optional; supplements registry base URLs) ─────────
 
 def _probe_plexamp(host, port=32500, timeout=1.5):
     """Probe a single host for Plexamp. Returns player dict or None."""
@@ -158,110 +182,274 @@ def add_cors(resp):
 _CURRENT_CLIENT_URL  = None
 _CURRENT_CLIENT_ID   = None
 
-def get_vhx(clientUrl=None, clientId=None):
-    """Return a PlexClient for the target player.
 
-    Strategy (in order):
-      1. If clientId given, look for it in active Plex server sessions.
-         If found, use the session player's address (Tailscale IP) — this
-         avoids direct-TCP failures when the LAN IP isn't reachable from Eva-PC.
-      2. If no match but a session exists, use the first active session.
-      3. Fallback: direct PlexClient from env/defaults (may fail on subnet mismatch).
+def _player_machine_id(player):
+    return (
+        getattr(player, "machineIdentifier", None)
+        or getattr(player, "deviceIdentifier", None)
+        or ""
+    )
+
+
+def _player_base_url(player):
+    addr = getattr(player, "address", None)
+    if addr:
+        return f"http://{addr}:{PLEXAMP_PORT}"
+    return None
+
+
+def _registry_by_machine_id(machine_id):
+    if not machine_id:
+        return None
+    mid = machine_id.strip().lower()
+    for alias, entry in CLIENT_REGISTRY.items():
+        if entry.get("machineId", "").lower() == mid:
+            return {**entry, "alias": alias}
+    return None
+
+
+def _registry_by_alias(alias):
+    if not alias:
+        return None
+    key = alias.strip().lower()
+    if key in CLIENT_REGISTRY:
+        return {**CLIENT_REGISTRY[key], "alias": key}
+    return None
+
+
+def _resolve_target_machine_id(clientId=None, clientUrl=None):
+    """Resolve desired player machine ID from explicit args, sticky state, or preference."""
+    cid = (clientId or _CURRENT_CLIENT_ID or "").strip()
+    if cid:
+        reg = _registry_by_alias(cid) or _registry_by_machine_id(cid)
+        if reg:
+            return reg["machineId"], reg.get("baseUrl") or clientUrl or _CURRENT_CLIENT_URL
+        return cid, clientUrl or _CURRENT_CLIENT_URL
+
+    if PREFERRED_CLIENT in CLIENT_REGISTRY:
+        reg = _registry_by_alias(PREFERRED_CLIENT)
+        return reg["machineId"], reg.get("baseUrl") or clientUrl or _CURRENT_CLIENT_URL
+
+    if PREFERRED_CLIENT == "auto":
+        return None, clientUrl or _CURRENT_CLIENT_URL
+
+    return None, clientUrl or _CURRENT_CLIENT_URL
+
+
+def _client_from_player(player, server):
+    base = _player_base_url(player)
+    mid = _player_machine_id(player) or "unknown"
+    if not base:
+        reg = _registry_by_machine_id(mid)
+        base = (reg or {}).get("baseUrl")
+    if not base:
+        raise RuntimeError(f"No reachable address for player {mid}")
+    log.info(f"get_vhx: session player → {base} (mid={mid})")
+    return PlexClient(
+        baseurl=base,
+        token=PLEX_TOKEN,
+        identifier=mid,
+        server=server,
+        timeout=PLEXAMP_CONNECT_TIMEOUT,
+    )
+
+
+def _client_from_direct(base_url, machine_id, server):
+    if not base_url or not machine_id:
+        raise RuntimeError("direct Plexamp connect requires baseUrl and machineId")
+    log.info(f"get_vhx: direct → {base_url} (mid={machine_id})")
+    return PlexClient(
+        baseurl=base_url,
+        token=PLEX_TOKEN,
+        identifier=machine_id,
+        server=server,
+        timeout=PLEXAMP_CONNECT_TIMEOUT,
+    )
+
+
+def _sessions_for_machine(server, machine_id):
+    if not machine_id:
+        return []
+    mid = machine_id.lower()
+    matches = []
+    for s in server.sessions():
+        player = getattr(s, "player", None)
+        if player and _player_machine_id(player).lower() == mid:
+            matches.append(s)
+    return matches
+
+
+def _pick_auto_session(sessions):
+    if not sessions:
+        return None
+    order = []
+    pref = PREFERRED_CLIENT
+    if pref in CLIENT_REGISTRY:
+        order.append(CLIENT_REGISTRY[pref]["machineId"].lower())
+    for entry in CLIENT_REGISTRY.values():
+        order.append(entry["machineId"].lower())
+    for target_mid in order:
+        for s in sessions:
+            player = getattr(s, "player", None)
+            if player and _player_machine_id(player).lower() == target_mid:
+                return s
+    return sessions[0]
+
+
+def get_vhx(clientUrl=None, clientId=None):
+    """Return a PlexClient for VECTORHXAI or Android (never local eva-pc Plexamp).
+
+    Priority:
+      1. Explicit clientId / sticky _CURRENT_CLIENT_ID (alias or machine ID)
+      2. Active Plex session for that machine (Tailscale/LAN address from player)
+      3. Registered baseUrl direct connect (short timeout)
+      4. auto: first active session matching registry preference order
+      5. Fail fast with a clear error (no stale LAN IP hang)
     """
     server = get_plex()
     sessions = list(server.sessions())
+    target_mid, target_url = _resolve_target_machine_id(clientId, clientUrl)
 
-    # Helper: create PlexClient from a session player
-    def _client_from_player(player):
-        addr = getattr(player, "address", None)
-        if addr:
-            base = f"http://{addr}:32500"
-        else:
-            base = VHX_URL
-        mid = getattr(player, "machineIdentifier", None) or getattr(player, "deviceIdentifier", None) or "unknown"
-        log.info(f"get_vhx: creating client from session → {base} (mid={mid})")
-        return PlexClient(baseurl=base, token=PLEX_TOKEN, identifier=mid, server=server)
-
-    # 1. Match by clientId
-    if clientId or _CURRENT_CLIENT_ID:
-        cid = clientId or _CURRENT_CLIENT_ID
+    if target_url and not target_mid:
         for s in sessions:
             player = getattr(s, "player", None)
-            if player:
-                mid = getattr(player, "machineIdentifier", None) or getattr(player, "deviceIdentifier", None)
-                if mid == cid:
-                    log.info(f"get_vhx: matched client by ID {cid}")
-                    return _client_from_player(player)
+            if player and _player_base_url(player) == target_url.rstrip("/"):
+                return _client_from_player(player, server)
 
-    # 2. Match by client URL fallback (prefer session address)
-    target_url = clientUrl or _CURRENT_CLIENT_URL or ""
-    if target_url:
-        for s in sessions:
-            player = getattr(s, "player", None)
-            if player and getattr(player, "address", None):
-                if f"http://{player.address}:32500".rstrip("/") == target_url.rstrip("/"):
-                    log.info(f"get_vhx: matched client by address {player.address}")
-                    return _client_from_player(player)
+    if target_mid:
+        for s in _sessions_for_machine(server, target_mid):
+            return _client_from_player(s.player, server)
+        reg = _registry_by_machine_id(target_mid)
+        direct_url = target_url or (reg or {}).get("baseUrl")
+        if direct_url:
+            try:
+                return _client_from_direct(direct_url, target_mid, server)
+            except Exception as e:
+                log.warning(f"get_vhx: direct connect failed for {target_mid}: {e}")
 
-    # 3. Use most recent active session
-    if sessions:
-        player = getattr(sessions[0], "player", None)
-        if player and getattr(player, "address", None):
-            log.info(f"get_vhx: using first active session → {player.address}")
-            return _client_from_player(player)
+    if PREFERRED_CLIENT == "auto" or not target_mid:
+        picked = _pick_auto_session(sessions)
+        if picked and getattr(picked, "player", None):
+            return _client_from_player(picked.player, server)
 
-    # 4. Last resort: direct PlexClient (will fail if on different subnet)
-    url = clientUrl or os.environ.get("VHX_URL") or _CURRENT_CLIENT_URL or VHX_URL
-    cid = clientId or os.environ.get("VHX_MACHINE") or _CURRENT_CLIENT_ID or VHX_MACHINE
-    log.warning(f"get_vhx: no active sessions, direct connect fallback {url}")
-    return PlexClient(
-        baseurl=url, token=PLEX_TOKEN,
-        identifier=cid, server=server
+    names = ", ".join(f"{v['name']} ({v['machineId'][:8]}…)" for v in CLIENT_REGISTRY.values())
+    raise RuntimeError(
+        "No reachable Plexamp player. Start playback on Android or VECTORHXAI, "
+        f"or POST /api/dj/set-client with a registry alias ({names})."
     )
+
+
+def _collect_registry_clients():
+    out = []
+    for alias, entry in CLIENT_REGISTRY.items():
+        out.append({
+            "alias": alias,
+            "name": entry.get("name", alias),
+            "clientId": entry.get("machineId", ""),
+            "machineId": entry.get("machineId", ""),
+            "baseUrl": entry.get("baseUrl") or None,
+            "product": "Plexamp",
+            "source": "registry",
+            "preferred": alias == PREFERRED_CLIENT or (
+                PREFERRED_CLIENT == "auto" and alias == "android"
+            ),
+        })
+    return out
+
+
+def _collect_session_clients(server):
+    out = []
+    for s in server.sessions():
+        player = getattr(s, "player", None)
+        if not player:
+            continue
+        mid = _player_machine_id(player)
+        reg = _registry_by_machine_id(mid)
+        out.append({
+            "alias": (reg or {}).get("alias"),
+            "name": getattr(player, "title", None) or getattr(player, "device", None) or "Unknown",
+            "clientId": mid,
+            "machineId": mid,
+            "baseUrl": _player_base_url(player),
+            "address": getattr(player, "address", None),
+            "product": getattr(player, "product", None) or "Plexamp",
+            "state": getattr(player, "state", None) or "unknown",
+            "source": "session",
+        })
+    return out
+
 
 @app.route("/api/dj/clients", methods=["GET", "OPTIONS"])
 def list_clients():
-    """Discover Plexamp clients on the LAN via concurrent port 32500 scan.
-    Falls back to Plex server sessions if no LAN clients found.
-    """
+    """List registered targets (Android, VECTORHXAI) plus live Plex sessions."""
     try:
-        force = request.args.get("refresh", "").lower() in ("1", "true", "yes")
-        lan_clients = get_plexamp_clients(force_refresh=force)
-        if lan_clients:
-            return ok(data={"clients": lan_clients, "source": "lan"})
-        # Fallback: try Plex server sessions
         server = get_plex()
-        sessions = []
-        try:
-            for s in server.sessions():
-                if s.player:
-                    sessions.append({
-                        "clientId":  s.player.deviceIdentifier or s.player.machineIdentifier or "",
-                        "name":      s.player.title or s.player.device or "Unknown",
-                        "baseUrl":   None,
-                        "product":   s.player.product or "",
-                        "state":     s.player.state or "unknown",
-                    })
-        except Exception:
-            pass
-        return ok(data={"clients": sessions, "source": "plex"})
+        registry = _collect_registry_clients()
+        active = _collect_session_clients(server)
+
+        force = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+        discovered = []
+        if force:
+            for c in get_plexamp_clients(force_refresh=True):
+                mid = c.get("machineId", "")
+                reg = _registry_by_machine_id(mid)
+                discovered.append({
+                    "alias": (reg or {}).get("alias"),
+                    "name": c.get("name"),
+                    "clientId": mid,
+                    "machineId": mid,
+                    "baseUrl": c.get("baseUrl"),
+                    "host": c.get("host"),
+                    "product": c.get("product", "Plexamp"),
+                    "source": "lan",
+                    "reachable": True,
+                })
+
+        return ok(data={
+            "clients": registry + active + discovered,
+            "registry": registry,
+            "active": active,
+            "discovered": discovered,
+            "preferred": PREFERRED_CLIENT,
+            "sticky": {
+                "clientId": _CURRENT_CLIENT_ID,
+                "baseUrl": _CURRENT_CLIENT_URL,
+            },
+        })
     except Exception as e:
         log.exception("clients error")
         return err(str(e), 500)
 
+
 @app.route("/api/dj/set-client", methods=["POST", "OPTIONS"])
 def set_client():
-    """Set the active Plex client for subsequent commands."""
+    """Set the active Plex client for subsequent commands (alias or machine ID)."""
     global _CURRENT_CLIENT_URL, _CURRENT_CLIENT_ID
-    body    = request.get_json(silent=True) or {}
-    url     = body.get("baseUrl")
-    clientId= body.get("clientId")
-    if not url or not clientId:
-        return err("baseUrl and clientId are required")
-    _CURRENT_CLIENT_URL = url
-    _CURRENT_CLIENT_ID  = clientId
-    log.info(f"Set client → {url} ({clientId})")
-    return ok(msg=f"Client set to {url}")
+    body = request.get_json(silent=True) or {}
+    url = (body.get("baseUrl") or "").strip() or None
+    client_id = (body.get("clientId") or body.get("alias") or "").strip()
+
+    if not client_id:
+        return err("clientId or alias is required (android | vectorhxai | machine ID)")
+
+    reg = _registry_by_alias(client_id) or _registry_by_machine_id(client_id)
+    if reg:
+        _CURRENT_CLIENT_ID = reg["machineId"]
+        _CURRENT_CLIENT_URL = url or reg.get("baseUrl") or _CURRENT_CLIENT_URL
+        label = reg.get("name", client_id)
+    else:
+        _CURRENT_CLIENT_ID = client_id
+        if url:
+            _CURRENT_CLIENT_URL = url
+
+    if not _CURRENT_CLIENT_URL and not _CURRENT_CLIENT_ID:
+        return err("Could not resolve client — provide baseUrl or a known alias")
+
+    log.info(f"Set client → {_CURRENT_CLIENT_URL} ({_CURRENT_CLIENT_ID})")
+    return ok(
+        msg=f"Client set to {_CURRENT_CLIENT_ID}",
+        data={"clientId": _CURRENT_CLIENT_ID, "baseUrl": _CURRENT_CLIENT_URL},
+    )
 
 
 # ── FAISS index (lazy load) ───────────────────────────────────────────────────
@@ -415,36 +603,86 @@ def semantic():
     if not q:
         return err("q is required")
     try:
-        index, rows = load_faiss()
-        model = _get_suggest_model()
-        q_emb = model.encode([q], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-
-        D, I = index.search(q_emb, k=min(limit * 3, index.ntotal))
-        seen   = set()
-        tracks = []
-        for dist, idx in zip(D[0], I[0]):
-            if idx < 0 or idx >= len(rows):
-                continue
-            _, album, title, key = rows[idx]
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                plex_track = get_plex().fetchItem(int(key))
-                tracks.append({**track_dict(plex_track), "score": round(float(dist), 4)})
-            except Exception:
-                tracks.append({"key": key, "title": title, "artist": _, "album": album, "score": round(float(dist), 4)})
-            if len(tracks) >= limit:
-                break
-
+        tracks, _ = _semantic_search_matches(q, limit=limit)
         return ok(data={"tracks": tracks, "query": q, "count": len(tracks)})
     except Exception as e:
         log.exception("semantic search error")
         return err(str(e), 500)
 
-# ── Suggest: natural language → Joe's library first, enrich from Plex ─────────
+# ── Semantic search + playlist sessions ───────────────────────────────────────
+
+MOOD_QUERIES = {
+    "happy": "upbeat cheerful feel-good",
+    "sad": "melancholic emotional",
+    "energetic": "high energy pump it",
+    "chill": "relaxed chill lofi downtempo",
+    "intense": "dark heavy aggressive",
+    "romantic": "romantic love ballads",
+    "nostalgic": "90s 2000s throwback",
+    "dark": "dark moody atmospheric",
+    "upbeat": "upbeat energetic positive",
+}
 
 _suggest_model = None
+
+def _resolve_vibe_query(body):
+    """Build a semantic search string from query and/or mood tag."""
+    mood = (body.get("mood") or "").strip().lower()
+    query = (body.get("query") or body.get("q") or "").strip()
+    mood_text = MOOD_QUERIES.get(mood, mood) if mood else ""
+    if mood_text and query:
+        return f"{query} {mood_text}"
+    return query or mood_text
+
+
+def _semantic_search_matches(query, limit=10, min_score=None, diversify=False, max_per_artist=2):
+    """FAISS semantic search → track metadata dicts + Plex Track objects."""
+    index, rows = load_faiss()
+    model = _get_suggest_model()
+    q_emb = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+
+    k = min(max(limit * 5, limit), index.ntotal)
+    D, I = index.search(q_emb, k=k)
+
+    seen_keys = set()
+    artist_counts = {}
+    tracks_meta = []
+    plex_tracks = []
+
+    for dist, idx in zip(D[0], I[0]):
+        if idx < 0 or idx >= len(rows):
+            continue
+        score = float(dist)
+        if min_score is not None and score < min_score:
+            continue
+
+        artist, album, title, key = rows[idx]
+        if key in seen_keys:
+            continue
+
+        if diversify:
+            artist_key = (artist or "").lower().strip() or "unknown"
+            if artist_counts.get(artist_key, 0) >= max_per_artist:
+                continue
+
+        try:
+            plex_track = get_plex().fetchItem(int(key))
+        except Exception:
+            log.warning(f"semantic: skip missing track key={key}")
+            continue
+
+        seen_keys.add(key)
+        if diversify:
+            artist_key = (artist or "").lower().strip() or "unknown"
+            artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
+
+        tracks_meta.append({**track_dict(plex_track), "score": round(score, 4)})
+        plex_tracks.append(plex_track)
+        if len(tracks_meta) >= limit:
+            break
+
+    return tracks_meta, plex_tracks
+
 
 def _get_suggest_model():
     global _suggest_model
@@ -659,6 +897,143 @@ def play():
         log.exception("play error")
         return err(str(e), 500)
 
+@app.route("/api/dj/playlist-session", methods=["POST", "OPTIONS"])
+def playlist_session():
+    """
+    Natural-language vibe → FAISS picks → Plex PlayQueue on chosen device.
+
+    POST /api/dj/playlist-session
+    {
+      "query": "chill late night coding",
+      "mood": "chill",
+      "limit": 15,
+      "shuffle": true,
+      "play": true,
+      "diversify": true,
+      "clientId": "android"
+    }
+    """
+    body = request.get_json(silent=True) or {}
+    query = _resolve_vibe_query(body)
+    if not query:
+        return err("query or mood is required")
+
+    limit = min(max(int(body.get("limit", 12)), 1), 50)
+
+    shuffle = body.get("shuffle", True)
+    if isinstance(shuffle, str):
+        shuffle = shuffle.strip().lower() in ("1", "true", "yes", "on")
+
+    play = body.get("play", True)
+    if isinstance(play, str):
+        play = play.strip().lower() in ("1", "true", "yes", "on")
+
+    play_next = body.get("playNext", body.get("play_next", False))
+    if isinstance(play_next, str):
+        play_next = play_next.strip().lower() in ("1", "true", "yes", "on")
+
+    diversify = body.get("diversify", True)
+    if isinstance(diversify, str):
+        diversify = diversify.strip().lower() in ("1", "true", "yes", "on")
+
+    min_score = body.get("minScore")
+    if min_score is not None:
+        min_score = float(min_score)
+
+    try:
+        tracks_meta, plex_tracks = _semantic_search_matches(
+            query,
+            limit=limit,
+            min_score=min_score,
+            diversify=diversify,
+        )
+        if not plex_tracks:
+            return err(f"No library tracks matched '{query}'", 404)
+
+        if shuffle and len(plex_tracks) > 1:
+            paired = list(zip(tracks_meta, plex_tracks))
+            random.shuffle(paired)
+            tracks_meta, plex_tracks = zip(*paired)
+            tracks_meta = list(tracks_meta)
+            plex_tracks = list(plex_tracks)
+
+        queue_key = None
+        client_id = body.get("clientId") or body.get("alias") or _CURRENT_CLIENT_ID
+        client_url = body.get("client") or _CURRENT_CLIENT_URL
+
+        appended = False
+        if play:
+            from plexapi.playqueue import PlayQueue
+
+            vhx = get_vhx(client_url, client_id)
+            if play_next:
+                pq_id = None
+                for tl in vhx.timelines():
+                    if tl.playQueueID:
+                        pq_id = tl.playQueueID
+                        break
+                if pq_id:
+                    pq = PlayQueue.get(get_plex(), pq_id)
+                    for i, track in enumerate(plex_tracks):
+                        pq.addItem(track, playNext=(i == 0))
+                    pq.refresh()
+                    queue_key = pq_id
+                    appended = True
+                    log.info(
+                        f"playlist-session: appended {len(plex_tracks)} tracks after current "
+                        f"→ queue {queue_key} (query={query!r})"
+                    )
+                else:
+                    log.info("playlist-session: playNext requested but no active queue — starting new set")
+                    pq = PlayQueue.create(get_plex(), plex_tracks, continuous=0)
+                    vhx.playMedia(pq)
+                    queue_key = getattr(pq, "playQueueID", None) or getattr(pq, "key", None)
+            else:
+                pq = PlayQueue.create(get_plex(), plex_tracks, continuous=0)
+                vhx.playMedia(pq)
+                queue_key = getattr(pq, "playQueueID", None) or getattr(pq, "key", None)
+                log.info(
+                    f"playlist-session: {len(plex_tracks)} tracks → queue {queue_key} "
+                    f"(query={query!r}, shuffle={shuffle})"
+                )
+
+        first = tracks_meta[0]
+        if play:
+            if appended:
+                msg = (
+                    f"Queued {len(tracks_meta)}-track set after current track for '{query}' "
+                    f"— up next: '{first['title']}' by {first.get('artist') or 'unknown'}"
+                )
+            else:
+                msg = (
+                    f"Playing {len(tracks_meta)}-track set for '{query}' "
+                    f"— starts with '{first['title']}' by {first.get('artist') or 'unknown'}"
+                )
+        else:
+            msg = f"Built {len(tracks_meta)}-track set for '{query}' (preview only, not playing)"
+
+        return ok(
+            msg=msg,
+            data={
+                "query": query,
+                "count": len(tracks_meta),
+                "shuffle": shuffle,
+                "diversify": diversify,
+                "played": play,
+                "playNext": play_next,
+                "appended": appended,
+                "queueKey": queue_key,
+                "clientId": client_id,
+                "baseUrl": client_url,
+                "firstTrack": first,
+                "tracks": tracks_meta,
+            },
+        )
+    except Exception as e:
+        log.exception("playlist-session error")
+        return err(str(e), 500)
+
+
 @app.route("/api/dj/queue", methods=["POST", "OPTIONS"])
 def queue():
     """
@@ -682,8 +1057,9 @@ def queue():
         pq = PlayQueue.create(get_plex(), tracks, continuous=0)
         # Tell client to play the queue
         vhx.playMedia(pq)
-        log.info(f"Queue: {len(tracks)} tracks → {pq.key}")
-        return ok(msg=f"Queue: {len(tracks)} tracks", data={"count": len(tracks), "queueKey": pq.key})
+        queue_key = getattr(pq, "playQueueID", None) or getattr(pq, "key", None)
+        log.info(f"Queue: {len(tracks)} tracks → queue {queue_key}")
+        return ok(msg=f"Queue: {len(tracks)} tracks", data={"count": len(tracks), "queueKey": queue_key})
     except Exception as e:
         log.exception("queue error")
         return err(str(e), 500)

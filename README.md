@@ -31,6 +31,8 @@ All endpoints return `{"ok": true, "data": ..., "ts": "…"}` on success, `{"ok"
 | GET | `/api/dj/search?q=<query>&limit=10` | Keyword search in Plex library |
 | GET | `/api/dj/semantic?q=<query>&limit=10` | FAISS semantic / natural-language search |
 | POST | `/api/dj/play` | `{"key": "/library/metadata/1234"}` |
+| POST | `/api/dj/playlist-session` | `{"query":"chill coding","limit":12,"playNext":false,"clientId":"android"}` |
+| POST | `/api/dj/playnext` | `{"ratingKey": "7758"}` — queue after current track |
 | POST | `/api/dj/control` | `{"action": "pause\|stop\|skipnext\|skipprev\|resume"}` |
 | POST | `/api/dj/volume` | `{"level": 80}` |
 | GET | `/api/dj/library?limit=30` | Random tracks from local library |
@@ -55,6 +57,8 @@ All via `/dj` (also aliases: `/music`, `/play`):
 | `/dj play key=7758` | Play by Plex ratingKey |
 
 Also: `/nowplaying` (alias `/np`) — shows what's currently playing.
+
+**LLM function tool:** `action: "playlist"` with `query` or `mood`, optional `limit` (default 12) and `playNext: true` for soft handoff.
 
 ---
 
